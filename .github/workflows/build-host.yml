@@ -76,7 +76,15 @@ jobs:
           cmake --build build -j 4 2>&1 | tee logs/build.log
       - name: Check again that no game code appeared
         run: test ! -e botw/generated
-      - name: Package without signing
+      - name: Sign ad hoc, to carry the memory limit request
+        run: |
+          # Alone, away from the bundle: Sideloadly and the like replace this signature and read what it asks for.
+          cp botw/ios/BotWHost.entitlements build/BotWRecomp.app/requested.entitlements
+          cp build/BotWRecomp.app/BotWRecomp "$RUNNER_TEMP/BotWRecomp"
+          codesign --force --sign - --identifier "$BOTW_BUNDLE_ID" --timestamp=none --entitlements botw/ios/BotWHost.entitlements "$RUNNER_TEMP/BotWRecomp"
+          codesign -d --entitlements - "$RUNNER_TEMP/BotWRecomp"
+          cp "$RUNNER_TEMP/BotWRecomp" build/BotWRecomp.app/BotWRecomp
+      - name: Package
         run: |
           mkdir -p out/licenses/botw out/licenses/cemu out/licenses/sdl3 out/licenses/fmt out/licenses/zstd
           nm -gU build/BotWRecomp.app/BotWRecomp | awk '{print $3}' | sort -u > out/host_exports.txt
