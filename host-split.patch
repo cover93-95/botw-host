@@ -54,12 +54,119 @@ index b0c511d..761a8ba 100644
  target_include_directories(BotWRecomp PRIVATE ${ROOT}/runtime/include ${ROOT}/runtime/src ${ROOT}/generated
  )
  target_compile_options(BotWRecomp PRIVATE -Wall -Wno-unused-function -Wno-unused-variable -fwrapv ${BOTW_CPU}
+diff --git a/ios/src/bootlog.h b/ios/src/bootlog.h
+new file mode 100644
+index 0000000..04e84e7
+--- /dev/null
++++ b/ios/src/bootlog.h
+@@ -0,0 +1,101 @@
++// What a first start leaves behind, however it ends (BOTW_SPLIT_HOST). A crash, a kill by iOS and a freeze all stop this
++// file at the last step reached, in a folder the Files app can read. Plain C++, so that it can be tested away from a phone.
++#pragma once
++#include <stdio.h>
++#include <string.h>
++#ifdef __APPLE__
++#include <unistd.h>
++#endif
++
++#include <string>
++
++namespace bootlog {
++struct Previous {
++    bool found = false;       // There was an earlier start.
++    bool finished = false;    // It reached the game's first frame, or ended cleanly.
++    std::string last_step;
++    int failures = 0;         // Earlier starts in a row that never reached a frame.
++};
++
++inline void sync_file(FILE* f) {
++    fflush(f);
++#ifdef __APPLE__
++    fsync(fileno(f));   // iOS kills without warning: what is not on disk did not happen.
++#endif
++}
++
++class Log {
++   public:
++    // Keeps the previous journal, and reads how it ended.
++    void begin(const std::string& folder) {
++        const std::string path = folder + "/botw_boot.txt", old = folder + "/botw_boot_prev.txt";
++        counter_ = folder + "/botw_boot_failures.txt";
++        if (FILE* f = fopen(path.c_str(), "r")) {
++            previous_.found = true;
++            char line[512];
++            while (fgets(line, sizeof line, f)) {
++                line[strcspn(line, "\r\n")] = 0;
++                if (!strncmp(line, "STEP ", 5)) previous_.last_step = line + 5;
++                if (!strcmp(line, "STEP first_frame") || !strcmp(line, "END clean")) previous_.finished = true;
++            }
++            fclose(f);
++            remove(old.c_str());
++            rename(path.c_str(), old.c_str());
++        }
++        if (FILE* f = fopen(counter_.c_str(), "r")) {
++            if (fscanf(f, "%d", &previous_.failures) != 1) previous_.failures = 0;
++            fclose(f);
++        }
++        if (previous_.found && !previous_.finished) previous_.failures++;
++        if (previous_.finished) previous_.failures = 0;
++        write_counter(previous_.failures);
++        file_ = fopen(path.c_str(), "w");
++    }
++    const Previous& previous() const { return previous_; }
++
++    void line(const char* text) {
++        if (!file_) return;
++        fprintf(file_, "%s\n", text);
++        sync_file(file_);
++    }
++    void step(const char* name, const std::string& memory = "") {
++        if (!file_) return;
++        fprintf(file_, "STEP %s\n", name);
++        if (!memory.empty()) fprintf(file_, "  %s\n", memory.c_str());
++        sync_file(file_);
++        if (!strcmp(name, "first_frame")) write_counter(0);
++    }
++
++   private:
++    void write_counter(int value) {
++        if (FILE* f = fopen(counter_.c_str(), "w")) {
++            fprintf(f, "%d\n", value);
++            fclose(f);
++        }
++    }
++    FILE* file_ = nullptr;
++    Previous previous_;
++    std::string counter_;
++};
++
++// After this many starts in a row with no frame, the next one asks less of the phone.
++constexpr int kFailuresBeforeSafeMode = 2;
++inline bool wants_safe_mode(const Previous& previous, bool user_asked) { return user_asked || previous.failures >= kFailuresBeforeSafeMode; }
++
++// A copy of a file, for one the Files app cannot reach. False when there was nothing to copy.
++inline bool copy_file(const std::string& from, const std::string& to) {
++    FILE* in = fopen(from.c_str(), "rb");
++    if (!in) return false;
++    FILE* out = fopen(to.c_str(), "wb");
++    if (!out) {
++        fclose(in);
++        return false;
++    }
++    char buffer[65536];
++    size_t n;
++    while ((n = fread(buffer, 1, sizeof buffer, in)) > 0) fwrite(buffer, 1, n, out);
++    fclose(in);
++    fclose(out);
++    return true;
++}
++}  // namespace bootlog
 diff --git a/ios/src/diag_ios.mm b/ios/src/diag_ios.mm
 new file mode 100644
-index 0000000..7320c7b
+index 0000000..51fc8a9
 --- /dev/null
 +++ b/ios/src/diag_ios.mm
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,409 @@
 +// What the phone really allows, measured before any game code runs (BOTW_SPLIT_HOST). See split_ios.h.
 +//
 +// Three numbers are kept apart on purpose. Virtual: address space taken, which reserving raises and which costs no
@@ -85,6 +192,7 @@ index 0000000..7320c7b
 +#include <string>
 +#include <vector>
 +
++#include "bootlog.h"
 +#include "entitlement_scan.h"
 +#include "split_ios.h"
 +
@@ -131,7 +239,7 @@ index 0000000..7320c7b
 +class Report {
 +   public:
 +    explicit Report(const char* docs) {
-+        std::string path = std::string(docs) + "/botw_diag_v2.txt";
++        std::string path = std::string(docs) + "/botw_diag_v3.txt";
 +        fd_ = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
 +    }
 +    ~Report() {
@@ -161,7 +269,7 @@ index 0000000..7320c7b
 +    std::string finish() {
 +        const char* verdict = failed_ ? "FAIL" : warned_ ? "WARN" : "PASS";
 +        line("RESULT DIAG %s", verdict);
-+        return summary_ + "\nDIAG " + verdict + "\nDetails: botw_diag_v2.txt in the app's files.";
++        return summary_ + "\nDIAG " + verdict + "\nDetails: botw_diag_v3.txt in the app's files.";
 +    }
 +
 +   private:
@@ -265,9 +373,78 @@ index 0000000..7320c7b
 +
 +std::string botw_mem_line() { return mem_text(read_mem()); }
 +
++namespace {
++bootlog::Log g_boot;
++bool g_safe_mode = false, g_had_log = false;
++std::string g_docs, g_runtime_log;
++}  // namespace
++
++std::string botw_boot_begin(const char* docs, const char* support) {
++    g_boot.begin(docs);
++    const bootlog::Previous& previous = g_boot.previous();
++    // Library is out of the Files app's reach, and the runtime's log is reopened empty on every start.
++    g_docs = docs;
++    g_runtime_log = std::string(support) + "/BotWRecomp/runtime.log";
++    const bool had_log = g_had_log = bootlog::copy_file(g_runtime_log, g_docs + "/runtime_prev.log");
++    bool asked = false;
++    if (FILE* f = fopen((std::string(docs) + "/safe_mode").c_str(), "r")) {
++        asked = true;
++        fclose(f);
++    }
++    g_safe_mode = bootlog::wants_safe_mode(previous, asked);
++
++    char s[512];
++    snprintf(s, sizeof s, "previous start: %s, last step %s, starts in a row with no frame %d, its log kept: %s, safe mode now: %s",
++             previous.found ? (previous.finished ? "reached a frame" : "ENDED EARLY") : "none", previous.last_step.empty() ? "-" : previous.last_step.c_str(),
++             previous.failures, yes_no(had_log), yes_no(g_safe_mode));
++    g_boot.line(s);
++    g_boot.step("launch", botw_mem_line());
++    return previous.found && !previous.finished ? s : "";
++}
++
++extern "C" void botw_boot_step(const char* name) { g_boot.step(name, botw_mem_line()); }
++bool botw_boot_safe_mode() { return g_safe_mode; }
++void botw_boot_end() { g_boot.line("END clean"); }
++
++namespace {
++// The journal, on the real file system. The runtime is not running here, so a marker stands for its log: the next start
++// has to find it and copy it where the Files app can read it.
++void report_boot(Report& r) {
++    bool wrote = false;
++    if (FILE* f = fopen((g_docs + "/botw_boot.txt").c_str(), "r")) {
++        char line[256];
++        while (fgets(line, sizeof line, f)) wrote = wrote || !strncmp(line, "STEP guest_load", 15);
++        fclose(f);
++    }
++    r.result("BOOT_JOURNAL", wrote ? "PASS" : "FAIL", wrote ? "botw_boot.txt holds this start's steps" : "this start's steps are not in botw_boot.txt");
++
++    const bootlog::Previous& p = g_boot.previous();
++    char s[320];
++    snprintf(s, sizeof s, "%s, last step %s, starts in a row with no frame %d", !p.found ? "first start" : p.finished ? "the last start ended cleanly" : "the last start ENDED EARLY",
++             p.last_step.empty() ? "-" : p.last_step.c_str(), p.failures);
++    r.result("BOOT_PREVIOUS", "PASS", s);
++    snprintf(s, sizeof s, "%s, it takes %d starts in a row with no frame", g_safe_mode ? "ON" : "off", bootlog::kFailuresBeforeSafeMode);
++    r.result("BOOT_SAFE_MODE", "PASS", s);
++
++    bool marker = false;
++    if (g_had_log) {
++        if (FILE* f = fopen((g_docs + "/runtime_prev.log").c_str(), "r")) {
++            char line[64] = {};
++            marker = fgets(line, sizeof line, f) && !strncmp(line, "diagnostic marker", 17);
++            fclose(f);
++        }
++    }
++    r.result("BOOT_LOG", !p.found || marker ? "PASS" : "FAIL", !p.found ? "first start: nothing to copy yet" : marker ? "the last start's log was copied to runtime_prev.log" : "the last start's log was not copied");
++    if (FILE* f = fopen(g_runtime_log.c_str(), "w")) {
++        fprintf(f, "diagnostic marker\n");
++        fclose(f);
++    }
++}
++}  // namespace
++
 +std::string botw_diag_run(const char* docs, GuestLoad guest) {
 +    Report r(docs);
-+    r.line("BotW host diagnostic v2. No game code ran.");
++    r.line("BotW host diagnostic v3. No game code ran.");
 +    const Mem launch = read_mem();
 +
 +    char model[64] = {};
@@ -280,6 +457,7 @@ index 0000000..7320c7b
 +           (unsigned long long)(memsize / kMiB));
 +    r.line("MEM launch: %s", mem_text(launch).c_str());
 +    report_authorization(r, launch, model);
++    report_boot(r);
 +
 +    // ---- Guest.framework ------------------------------------------------------------------------
 +    uint64_t base = 0, size = 0;
@@ -561,7 +739,7 @@ index 0000000..817c4d6
 +}
 +#endif
 diff --git a/ios/src/main_ios.mm b/ios/src/main_ios.mm
-index dee5dcb..82e098d 100644
+index dee5dcb..4be2f00 100644
 --- a/ios/src/main_ios.mm
 +++ b/ios/src/main_ios.mm
 @@ -15,6 +15,9 @@
@@ -574,12 +752,13 @@ index dee5dcb..82e098d 100644
  
  int botw_main(int argc, char** argv);
  
-@@ -58,8 +61,12 @@ void start_stats_thread(std::string device) {
+@@ -58,8 +61,13 @@ void start_stats_thread(std::string device) {
              std::this_thread::sleep_for(std::chrono::seconds(first ? 2 : 10));
              if (first) LOG("%s", device.c_str());  // the log file is open by now
              first = false;
 +#ifdef BOTW_SPLIT_HOST
 +            LOG("ios: %s", botw_mem_line().c_str());
++            botw_boot_step("alive");   // The last one tells how long the app lasted, and with how much memory.
 +#else
              LOG("ios: footprint %llu MB, available before jetsam %llu MB",
                  (unsigned long long)(footprint_bytes() >> 20), (unsigned long long)(os_proc_available_memory() >> 20));
@@ -587,34 +766,59 @@ index dee5dcb..82e098d 100644
          }
      }).detach();
  }
-@@ -79,6 +86,21 @@ int ios_main(int argc, char** argv) {
+@@ -79,6 +87,34 @@ int ios_main(int argc, char** argv) {
      [kReadme writeToFile:[docs stringByAppendingPathComponent:@"README.txt"] atomically:YES
                  encoding:NSUTF8StringEncoding error:nil];
  
 +#ifdef BOTW_SPLIT_HOST
++    const std::string after_failure = botw_boot_begin(docs.UTF8String, support.UTF8String);
++    botw_boot_step("guest_load");
 +    // Before mem::init: the framework has to take its place below the shared cache, because the 4 GB guest space
 +    // only fits above it. With no game code in the app there is only the diagnostic to run.
 +    const GuestLoad guest = botw_guest_load();
 +    if (guest != GuestLoad::Game) {
 +        const std::string summary = botw_diag_run(docs.UTF8String, guest);
-+        const SDL_MessageBoxButtonData done[] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "OK"}};
++        const SDL_MessageBoxButtonData done[] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "OK"}, {0, 1, "Test a crash"}};
 +        const SDL_MessageBoxData box = {SDL_MESSAGEBOX_INFORMATION, nullptr, "BotW host diagnostic", summary.c_str(),
-+                                        1, done, nullptr};
++                                        2, done, nullptr};
 +        int pressed = 0;
 +        SDL_ShowMessageBox(&box, &pressed);
++        if (pressed == 1) {   // A real crash, for the next start to report: only the phone can show the journal survives one.
++            botw_boot_step("crash_test");
++            abort();
++        }
++        botw_boot_end();
 +        return 0;
++    }
++    if (!after_failure.empty()) {
++        const SDL_MessageBoxButtonData go_on[] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "Continue"}};
++        const SDL_MessageBoxData notice = {SDL_MESSAGEBOX_WARNING, nullptr, "The last start ended early", after_failure.c_str(), 1, go_on, nullptr};
++        int pressed = 0;
++        SDL_ShowMessageBox(&notice, &pressed);
 +    }
 +#endif
 +
      std::vector<std::string> args(argv, argv + argc);
      bool has_game_arg = false;
      for (auto& a : args) has_game_arg |= a == "--game";
+@@ -118,6 +154,11 @@ int ios_main(int argc, char** argv) {
+              (unsigned long long)(os_proc_available_memory() >> 20));
+     start_stats_thread(device);
+ 
++#ifdef BOTW_SPLIT_HOST
++    if (botw_boot_safe_mode()) {   // The original frame rate and resolution: runtime/src/main.cpp's own switches.
++        for (const char* a : {"--fps", "30", "--scale", "1"}) args.push_back(a);
++    }
++#endif
+     std::vector<char*> cargv;
+     for (auto& a : args) cargv.push_back(a.data());
+     cargv.push_back(nullptr);
 diff --git a/ios/src/split_ios.h b/ios/src/split_ios.h
 new file mode 100644
-index 0000000..9175609
+index 0000000..1cca897
 --- /dev/null
 +++ b/ios/src/split_ios.h
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,30 @@
 +// The host built without generated/ (BOTW_SPLIT_HOST): loading Guest.framework, and the diagnostic.
 +#pragma once
 +#include <cstdint>
@@ -633,6 +837,13 @@ index 0000000..9175609
 +bool botw_guest_fixture_test(std::string& out);
 +// Where the framework's code landed, and its size in memory. 0 when none is loaded.
 +void botw_guest_image(uint64_t& base, uint64_t& size);
++
++// The first start's journal (bootlog.h). botw_boot_step is safe to call before botw_boot_begin.
++// Returns the arguments the runtime should add: a repeated failure asks less of the phone.
++std::string botw_boot_begin(const char* docs, const char* support);
++extern "C" void botw_boot_step(const char* name);
++bool botw_boot_safe_mode();
++void botw_boot_end();
 +
 +// One line that keeps apart what is only reserved (virtual) from what iOS counts against the app (footprint).
 +std::string botw_mem_line();
@@ -662,3 +873,78 @@ index 782c4c3..1f1adc3 100644
  extern const GuestImportEntry g_guest_imports[];
  extern const uint32_t g_guest_import_count;
 +#endif
+diff --git a/runtime/src/host/window.mm b/runtime/src/host/window.mm
+index 18da3aa..65bd4c7 100644
+--- a/runtime/src/host/window.mm
++++ b/runtime/src/host/window.mm
+@@ -25,6 +25,10 @@ extern std::atomic<pthread_t> g_gpu_thread;  // cemu_shims/overlay_menu.cpp: Cem
+ 
+ extern "C" int g_trace_hle;
+ 
++#ifdef BOTW_SPLIT_HOST
++extern "C" void botw_boot_step(const char* name);
++#endif
++
+ namespace window {
+ namespace {
+ SDL_Window* g_win = nullptr;
+@@ -363,6 +367,15 @@ void run() {
+             }
+         }
+         apply_input();
++#ifdef BOTW_SPLIT_HOST
++        {
++            static bool first_frame_seen = false;
++            if (!first_frame_seen && g_game_frames) {
++                first_frame_seen = true;
++                botw_boot_step("first_frame");
++            }
++        }
++#endif
+         // Freeze watchdog: no game frame for 8 s while in the foreground -> log every thread (once a minute)
+         {
+             static uint64_t seen = 0, changed_ms = 0, dumped_ms = 0;
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 5b5932e..2e729d4 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -37,6 +37,13 @@ extern "C" PPC_NORETURN void rt_fatal_exit(void) {
+ bool debug_watch_fault(void* addr, void* uctx);
+ void debug_watch_init();
+ 
++#ifdef BOTW_SPLIT_HOST
++extern "C" void botw_boot_step(const char* name);
++#define BOOT_STEP(name) botw_boot_step(name)
++#else
++#define BOOT_STEP(name)
++#endif
++
+ static void on_fault(int sig, siginfo_t* si, void* uctx) {
+     if (debug_watch_fault(si->si_addr, uctx)) return;
+     uintptr_t a = (uintptr_t)si->si_addr, base = (uintptr_t)g_mem;
+@@ -97,10 +104,15 @@ int main(int argc, char** argv) {
+         _exit(6);
+     });
+ 
++    BOOT_STEP("mem_init");
+     mem::init();
++    BOOT_STEP("dispatch_init");
+     dispatch::init();
++    BOOT_STEP("load_main");
+     if (!loader::load_main(g_game_root + "/code/U-King.rpx")) return 1;
++    BOOT_STEP("os_init");
+     os::init();
++    BOOT_STEP("window");
+     window::create();
+     if (g_render_scale <= 0) {  // render at the display's native resolution, so fullscreen is 1:1
+         int dw, dh;
+@@ -113,7 +125,9 @@ int main(int argc, char** argv) {
+     if (capture_every) latte::set_capture(capture_every, (g_user_root + "/captures").c_str());
+ 
+     uint32_t argv_g = os::build_argv("U-King.rpx");
++    BOOT_STEP("game_thread");
+     threads::start_main(loader::main_module().entry, 1, argv_g, loader::main_module().stack_size);
+     os::host_main_loop();  // returns when the game exits or the time limit is reached
++    BOOT_STEP("host_loop_ended");
+     return 0;
+ }
