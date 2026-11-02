@@ -1,3 +1,17 @@
+diff --git a/ios/BotWHost.entitlements b/ios/BotWHost.entitlements
+new file mode 100644
+index 0000000..99f4716
+--- /dev/null
++++ b/ios/BotWHost.entitlements
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++	<key>com.apple.developer.kernel.increased-memory-limit</key>
++	<true/>
++</dict>
++</plist>
 diff --git a/ios/CMakeLists.txt b/ios/CMakeLists.txt
 index b0c511d..761a8ba 100644
 --- a/ios/CMakeLists.txt
@@ -42,10 +56,10 @@ index b0c511d..761a8ba 100644
  target_compile_options(BotWRecomp PRIVATE -Wall -Wno-unused-function -Wno-unused-variable -fwrapv ${BOTW_CPU}
 diff --git a/ios/src/diag_ios.mm b/ios/src/diag_ios.mm
 new file mode 100644
-index 0000000..e0594fc
+index 0000000..7320c7b
 --- /dev/null
 +++ b/ios/src/diag_ios.mm
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,338 @@
 +// What the phone really allows, measured before any game code runs (BOTW_SPLIT_HOST). See split_ios.h.
 +//
 +// Three numbers are kept apart on purpose. Virtual: address space taken, which reserving raises and which costs no
@@ -71,6 +85,7 @@ index 0000000..e0594fc
 +#include <string>
 +#include <vector>
 +
++#include "entitlement_scan.h"
 +#include "split_ios.h"
 +
 +namespace {
@@ -78,6 +93,11 @@ index 0000000..e0594fc
 +const size_t kGuestSpace = (1ull << 32) + 0x10000;  // runtime/src/mem.cpp
 +const size_t kPage = 16 * 1024;
 +const int kFlags = MAP_ANON | MAP_PRIVATE | MAP_NORESERVE;
++const char* const kMemoryLimit = "com.apple.developer.kernel.increased-memory-limit";
++const char* const kExtendedVa = "com.apple.developer.kernel.extended-virtual-addressing";
++const char* const kReferenceModel = "iPhone19,4";   // What the first diagnostic measured there, with no authorization:
++const uint64_t kReferenceAvailableMiB = 3367;       // the number a real gain has to beat.
++const uint64_t kRealGainMiB = 256;
 +const int kGuestThreads = 40;                       // ios/PORTING.md: about 40 guest threads
 +const size_t kCappedStack = 16 * kMiB;              // ios/src/vm_ios.cpp, without extended addressing
 +
@@ -111,7 +131,7 @@ index 0000000..e0594fc
 +class Report {
 +   public:
 +    explicit Report(const char* docs) {
-+        std::string path = std::string(docs) + "/botw_diag.txt";
++        std::string path = std::string(docs) + "/botw_diag_v2.txt";
 +        fd_ = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
 +    }
 +    ~Report() {
@@ -141,7 +161,7 @@ index 0000000..e0594fc
 +    std::string finish() {
 +        const char* verdict = failed_ ? "FAIL" : warned_ ? "WARN" : "PASS";
 +        line("RESULT DIAG %s", verdict);
-+        return summary_ + "\nDIAG " + verdict + "\nDetails: botw_diag.txt in the app's files.";
++        return summary_ + "\nDIAG " + verdict + "\nDetails: botw_diag_v2.txt in the app's files.";
 +    }
 +
 +   private:
@@ -181,13 +201,50 @@ index 0000000..e0594fc
 +    return pieces.size() * 64 * kMiB;
 +}
 +
-+bool profile_grants(const char* entitlement, bool& has_profile) {
-+    NSString* path = [NSBundle.mainBundle pathForResource:@"embedded" ofType:@"mobileprovision"];
-+    NSData* data = path ? [NSData dataWithContentsOfFile:path] : nil;
-+    has_profile = data != nil;
-+    if (!data) return false;
-+    return [data rangeOfData:[NSData dataWithBytes:entitlement length:strlen(entitlement)] options:0
-+                       range:NSMakeRange(0, data.length)].location != NSNotFound;
++NSData* bundle_file(NSString* name, NSString* type) {
++    NSString* path = [NSBundle.mainBundle pathForResource:name ofType:type];
++    return path ? [NSData dataWithContentsOfFile:path] : nil;
++}
++
++const char* yes_no(bool value) { return value ? "yes" : "no"; }
++
++// Four different facts, which is why each gets its own line: what this build asks for, what the installer's signature
++// kept, what Apple's profile grants, and what iOS then really leaves the app.
++void report_authorization(Report& r, const Mem& launch, const char* model) {
++    using entitlement_scan::declares;
++    NSData* requested = bundle_file(@"requested", @"entitlements");
++    const bool asked = requested && declares(requested.bytes, requested.length, kMemoryLimit);
++    const bool asked_va = requested && declares(requested.bytes, requested.length, kExtendedVa);
++    r.result("AUTH_REQUESTED", asked && !asked_va ? "PASS" : "WARN",
++             std::string("this build asks for increased-memory-limit: ") + yes_no(asked) + ", extended-virtual-addressing: " + yes_no(asked_va));
++
++    NSData* executable = [NSData dataWithContentsOfFile:NSBundle.mainBundle.executablePath options:NSDataReadingMappedIfSafe error:nil];
++    const std::string signature = executable ? entitlement_scan::from_signature((const uint8_t*)executable.bytes, executable.length) : "";
++    const bool signed_limit = declares(signature.data(), signature.size(), kMemoryLimit);
++    const bool signed_va = declares(signature.data(), signature.size(), kExtendedVa);
++    r.result("AUTH_SIGNATURE", signed_limit ? "PASS" : "WARN",
++             std::string("the installed signature holds entitlements: ") + yes_no(!signature.empty()) + ", increased-memory-limit: " + yes_no(signed_limit) + ", extended-virtual-addressing: " + yes_no(signed_va));
++
++    NSData* profile = bundle_file(@"embedded", @"mobileprovision");
++    const bool granted = profile && declares(profile.bytes, profile.length, kMemoryLimit);
++    const bool granted_va = profile && declares(profile.bytes, profile.length, kExtendedVa);
++    r.result("AUTH_PROFILE", granted ? "PASS" : "WARN",
++             std::string("a profile is present: ") + yes_no(profile != nil) + ", it grants increased-memory-limit: " + yes_no(granted) + ", extended-virtual-addressing: " + yes_no(granted_va));
++
++    r.result("MEMORY_LIMIT", signed_limit && granted ? "PASS" : "WARN",
++             signed_limit && granted ? "signed and granted" : !asked ? "not requested by this build" : !signed_limit ? "lost at signing" : "not granted by the profile");
++
++    const uint64_t available = launch.available / kMiB;
++    char s[192];
++    if (!strcmp(model, kReferenceModel)) {
++        const long long change = (long long)available - (long long)kReferenceAvailableMiB;
++        snprintf(s, sizeof s, "%llu MiB at launch, %+lld MiB against %llu MiB without the authorization",
++                 (unsigned long long)available, change, (unsigned long long)kReferenceAvailableMiB);
++        r.result("MEMORY_AVAILABLE", change >= (long long)kRealGainMiB ? "PASS" : "WARN", s);
++    } else {
++        snprintf(s, sizeof s, "%llu MiB at launch, no reference for %s", (unsigned long long)available, model);
++        r.result("MEMORY_AVAILABLE", "WARN", s);
++    }
 +}
 +
 +// Threads with the stack size the runtime would give guest threads, parked until released.
@@ -210,7 +267,8 @@ index 0000000..e0594fc
 +
 +std::string botw_diag_run(const char* docs, GuestLoad guest) {
 +    Report r(docs);
-+    r.line("BotW host diagnostic. No game code ran.");
++    r.line("BotW host diagnostic v2. No game code ran.");
++    const Mem launch = read_mem();
 +
 +    char model[64] = {};
 +    size_t len = sizeof model;
@@ -220,14 +278,8 @@ index 0000000..e0594fc
 +    sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0);
 +    r.line("device %s, iOS %s, RAM %llu MiB", model, UIDevice.currentDevice.systemVersion.UTF8String,
 +           (unsigned long long)(memsize / kMiB));
-+    r.line("MEM launch: %s", botw_mem_line().c_str());
-+
-+    bool has_profile = false;
-+    const bool memory_limit = profile_grants("com.apple.developer.kernel.increased-memory-limit", has_profile);
-+    const bool extended_va = profile_grants("com.apple.developer.kernel.extended-virtual-addressing", has_profile);
-+    r.line("profile %s, increased-memory-limit %s, extended-virtual-addressing %s", has_profile ? "present" : "absent",
-+           memory_limit ? "granted" : "not granted", extended_va ? "granted" : "not granted");
-+    if (!memory_limit) r.result("MEMORY_LIMIT", "WARN", "the profile does not grant the increased memory limit");
++    r.line("MEM launch: %s", mem_text(launch).c_str());
++    report_authorization(r, launch, model);
 +
 +    // ---- Guest.framework ------------------------------------------------------------------------
 +    uint64_t base = 0, size = 0;
@@ -346,6 +398,69 @@ index 0000000..e0594fc
 +    return r.finish();
 +}
 +#endif
+diff --git a/ios/src/entitlement_scan.h b/ios/src/entitlement_scan.h
+new file mode 100644
+index 0000000..bc571bc
+--- /dev/null
++++ b/ios/src/entitlement_scan.h
+@@ -0,0 +1,57 @@
++// Reading entitlements from a file, a code signature or a provisioning profile, with no Apple API (BOTW_SPLIT_HOST).
++// Plain C++, so that it can also be tested away from a phone.
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <string>
++
++namespace entitlement_scan {
++// `<key>name</key>` followed by `<true/>`. A profile wraps its plist in a signature, so this looks through any bytes.
++inline bool declares(const void* data, size_t size, const char* name) {
++    const std::string key = std::string("<key>") + name + "</key>";
++    auto* begin = (const char*)data;
++    const char* end = begin + size;
++    for (const char* p = begin; p + key.size() <= end; p++) {
++        p = (const char*)memchr(p, '<', end - p);
++        if (!p || p + key.size() > end) return false;
++        if (memcmp(p, key.data(), key.size())) continue;
++        const char* v = p + key.size();
++        while (v < end && (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n')) v++;
++        return end - v >= 7 && !memcmp(v, "<true/>", 7);
++    }
++    return false;
++}
++
++inline uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
++inline uint32_t le32(const uint8_t* p) { return (uint32_t)p[3] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[1] << 8 | p[0]; }
++
++// The entitlements plist in a thin arm64 executable's code signature. Empty when it has no signature or no such blob.
++inline std::string from_signature(const uint8_t* file, size_t size) {
++    if (size < 32 || le32(file) != 0xFEEDFACFu) return "";
++    const uint32_t ncmds = le32(file + 16);
++    size_t at = 32;
++    uint32_t offset = 0, length = 0;
++    for (uint32_t i = 0; i < ncmds && at + 8 <= size; i++) {
++        const uint32_t cmd = le32(file + at), cmdsize = le32(file + at + 4);
++        if (cmdsize < 8) return "";
++        if (cmd == 0x1D && at + 16 <= size) {  // LC_CODE_SIGNATURE
++            offset = le32(file + at + 8);
++            length = le32(file + at + 12);
++        }
++        at += cmdsize;
++    }
++    if (!offset || (uint64_t)offset + length > size || length < 12) return "";
++    const uint8_t* blob = file + offset;
++    if (be32(blob) != 0xFADE0CC0u) return "";  // CSMAGIC_EMBEDDED_SIGNATURE
++    const uint32_t count = be32(blob + 8);
++    for (uint32_t i = 0; i < count && 12 + (uint64_t)(i + 1) * 8 <= length; i++) {
++        const uint32_t type = be32(blob + 12 + i * 8), where = be32(blob + 16 + i * 8);
++        if (type != 5 || (uint64_t)where + 8 > length) continue;  // CSSLOT_ENTITLEMENTS
++        const uint32_t size_in_blob = be32(blob + where + 4);
++        if (be32(blob + where) != 0xFADE7171u || size_in_blob < 8 || (uint64_t)where + size_in_blob > length) return "";
++        return std::string((const char*)blob + where + 8, size_in_blob - 8);
++    }
++    return "";
++}
++}  // namespace entitlement_scan
 diff --git a/ios/src/guest_ios.mm b/ios/src/guest_ios.mm
 new file mode 100644
 index 0000000..817c4d6
