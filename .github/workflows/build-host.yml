@@ -1,0 +1,101 @@
+# Builds BotWRecomp's iOS host with no game file, key, recompiled code, certificate or secret anywhere in the job.
+# It only starts by hand. By default it stops after reporting the toolchain; the build needs "build" ticked.
+name: Build the BotW host
+
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: Build the host (otherwise only check the toolchain)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  BOTW_COMMIT: 2b84b82dbe7efe41707d236fdbac9ec5e98c8d3d
+  # The image's default Xcode may be another version: this path selects the one ios/PORTING.md builds with.
+  DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+  EXPECTED_XCODE: Xcode 27.2
+  BOTW_BUNDLE_ID: local.iswitchduo.botw
+
+defaults:
+  run:
+    shell: bash   # Named, so that a failure before a pipe's last command fails the step.
+
+jobs:
+  toolchain:
+    name: Check the toolchain
+    runs-on: xcode-27   # A standard runner. Never xcode-27-xlarge: that one is a billed larger runner.
+    timeout-minutes: 10
+    steps:
+      - name: Report and compare
+        run: |
+          sw_vers
+          uname -m
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          xcrun -sdk iphoneos --show-sdk-version
+          test "$(xcodebuild -version | head -1)" = "$EXPECTED_XCODE"
+
+  host:
+    name: Build the host
+    needs: toolchain
+    if: ${{ inputs.build }}
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: tools
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: IshaanKalra2103/BotWRecomp
+          ref: ${{ env.BOTW_COMMIT }}
+          persist-credentials: false
+          path: botw
+      - name: Apply the host patch
+        run: git -C botw apply "$GITHUB_WORKSPACE/tools/host-split.patch"
+      - name: Check that no game code is here
+        run: |
+          test ! -e botw/generated
+          test ! -e botw/game
+          test ! -e game
+      - name: Install the tools
+        run: brew install cmake ninja boost glm
+      - name: Build SDL3, fmt and zstd from their pinned sources
+        run: botw/ios/scripts/build_deps.sh iphoneos
+      - name: Build the host
+        run: |
+          mkdir -p logs
+          cmake -S botw/ios -B build -G Ninja -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 \
+            -DBOTW_SPLIT_HOST=ON -DBOTW_BUNDLE_ID="$BOTW_BUNDLE_ID" -DBOTW_IOS_DEPS="$GITHUB_WORKSPACE/botw/ios-deps" 2>&1 | tee logs/configure.log
+          cmake --build build -j 4 2>&1 | tee logs/build.log
+      - name: Check again that no game code appeared
+        run: test ! -e botw/generated
+      - name: Package without signing
+        run: |
+          mkdir -p out/licenses/botw out/licenses/cemu out/licenses/sdl3 out/licenses/fmt out/licenses/zstd
+          nm -gU build/BotWRecomp.app/BotWRecomp | awk '{print $3}' | sort -u > out/host_exports.txt
+          ditto -c -k --keepParent build/BotWRecomp.app out/BotWHost.app.zip
+          cp botw/LICENSE out/licenses/botw/
+          cp botw/runtime/cemu/LICENSE.txt out/licenses/cemu/
+          cp botw/ios-deps/SDL3-*/LICENSE* out/licenses/sdl3/
+          cp botw/ios-deps/fmt-*/LICENSE* out/licenses/fmt/
+          cp botw/ios-deps/zstd-*/LICENSE* out/licenses/zstd/
+      - name: Refuse anything of a game
+        run: python3 tools/check_host_artifact.py out/BotWHost.app.zip out/host_exports.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: botw-host
+          path: out
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: logs-host-build
+          path: logs
+          retention-days: 7
