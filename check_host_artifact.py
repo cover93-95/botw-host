@@ -13,7 +13,7 @@ GUEST_SYMBOL = re.compile(r"^_(f_[0-9a-f]{8}|g_guest_functions|g_guest_imports)$
 RPX_MAGIC = b"\x7fELF\x01\x02\x01\xca\xfe"
 MAX_EXECUTABLE = 150 * 1024 * 1024   # The real binary with the game's code is 383 MB. The host alone must be far below.
 ONLY_MEMORY_LIMIT = {"com.apple.developer.kernel.increased-memory-limit": True}
-REQUIRED_EXPORTS = {"_rt_call", "_rt_trap", "_rt_unimplemented", "_rt_bad_return", "_g_mem", "_botw_split_ping", "_botw_boot_step"}
+REQUIRED_EXPORTS = {"_rt_call", "_rt_trap", "_rt_unimplemented", "_rt_bad_return", "_g_mem", "_botw_split_ping", "_botw_boot_step", "__Z15botw_perf_startPKc"}
 
 
 def signature_entitlements(exe):

@@ -13,7 +13,7 @@ index 0000000..99f4716
 +</dict>
 +</plist>
 diff --git a/ios/CMakeLists.txt b/ios/CMakeLists.txt
-index b0c511d..761a8ba 100644
+index b0c511d..b3df890 100644
 --- a/ios/CMakeLists.txt
 +++ b/ios/CMakeLists.txt
 @@ -39,6 +39,11 @@ find_package(zstd REQUIRED CONFIG PATHS ${DEPS}/lib/cmake/zstd NO_DEFAULT_PATH)
@@ -36,7 +36,17 @@ index b0c511d..761a8ba 100644
  
  # ---- vendored Cemu Latte GPU + shims ---------------------------------------------------------
  file(GLOB_RECURSE CEMU_SOURCES CONFIGURE_DEPENDS
-@@ -86,8 +92,15 @@ file(GLOB IOS_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.mm ${C
+@@ -75,6 +81,9 @@ target_include_directories(cemu_gpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat
+   ${ROOT}/runtime/cemu/dependencies/metal-cpp ${ROOT}/runtime/cemu/dependencies/imgui
+   /opt/homebrew/opt/boost/include /opt/homebrew/opt/glm/include)
+ target_link_libraries(cemu_gpu PRIVATE fmt::fmt zstd::libzstd_static)
++if(BOTW_SPLIT_HOST)
++  target_compile_definitions(cemu_gpu PRIVATE BOTW_SPLIT_HOST)
++endif()
+ target_compile_definitions(cemu_gpu PRIVATE BOOST_NOWIDE_NO_LIB ENABLE_METAL BOTWRECOMP IMGUI_IMPL_METAL_CPP
+   EMULATOR_VERSION_MAJOR=2 EMULATOR_VERSION_MINOR=6 EMULATOR_VERSION_PATCH=0 EMULATOR_HASH=a53cf0e)
+ target_compile_options(cemu_gpu PRIVATE -w -O2 -g1
+@@ -86,8 +95,15 @@ file(GLOB IOS_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.mm ${C
  # main.cpp's main() becomes botw_main(); ios/src/main_ios.mm owns main() (UIApplicationMain via SDL)
  set_source_files_properties(${ROOT}/runtime/src/main.cpp PROPERTIES COMPILE_DEFINITIONS "main=botw_main")
  # CEMU_SOURCES with the AppKit view excluded need a CreateMetalLayer: ios/src/MetalLayer_ios.mm
@@ -739,7 +749,7 @@ index 0000000..817c4d6
 +}
 +#endif
 diff --git a/ios/src/main_ios.mm b/ios/src/main_ios.mm
-index dee5dcb..4be2f00 100644
+index dee5dcb..42f7165 100644
 --- a/ios/src/main_ios.mm
 +++ b/ios/src/main_ios.mm
 @@ -15,6 +15,9 @@
@@ -801,7 +811,7 @@ index dee5dcb..4be2f00 100644
      std::vector<std::string> args(argv, argv + argc);
      bool has_game_arg = false;
      for (auto& a : args) has_game_arg |= a == "--game";
-@@ -118,6 +154,11 @@ int ios_main(int argc, char** argv) {
+@@ -118,6 +154,14 @@ int ios_main(int argc, char** argv) {
               (unsigned long long)(os_proc_available_memory() >> 20));
      start_stats_thread(device);
  
@@ -810,15 +820,80 @@ index dee5dcb..4be2f00 100644
 +        for (const char* a : {"--fps", "30", "--scale", "1"}) args.push_back(a);
 +    }
 +#endif
++#ifdef BOTW_SPLIT_HOST
++    botw_perf_start(docs.UTF8String);
++#endif
      std::vector<char*> cargv;
      for (auto& a : args) cargv.push_back(a.data());
      cargv.push_back(nullptr);
+diff --git a/ios/src/perf_ios.mm b/ios/src/perf_ios.mm
+new file mode 100644
+index 0000000..b88022b
+--- /dev/null
++++ b/ios/src/perf_ios.mm
+@@ -0,0 +1,56 @@
++// Writes the measurements of cemu_shims/botw_perf.h to <Documents>/botw_perf.csv every 5 s, from a low-priority thread.
++// On by default in this build; a file <Documents>/botw_perf_off turns it off. The previous run's file is kept.
++#ifdef BOTW_SPLIT_HOST
++#import <Foundation/Foundation.h>
++#include <mach/mach.h>
++#include <os/proc.h>
++#include <pthread.h>
++#include <unistd.h>
++
++#include <cstdio>
++#include <string>
++#include <thread>
++
++#include "../../runtime/cemu_shims/botw_perf.h"
++#include "split_ios.h"
++
++namespace {
++constexpr int kWindowSeconds = 5;
++
++void write_loop(FILE* out) {
++    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
++    pthread_setname_np("botw_perf");
++    fprintf(out, "%s,footprint_mb,available_mb,thermal\n", botw_perf::kHeader);
++    fflush(out);
++    const uint64_t begin = botw_perf::now_ns();
++    uint64_t last = begin;
++    for (;;) {
++        sleep(kWindowSeconds);
++        const uint64_t now = botw_perf::now_ns();
++        char line[1024];
++        const int n = botw_perf::write_window(line, sizeof line, (now - begin) / 1e9, (now - last) / 1e9);
++        last = now;
++        task_vm_info_data_t vm = {};
++        mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
++        const bool ok = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS;
++        fprintf(out, "%.*s,%llu,%llu,%d\n", n, line, ok ? (unsigned long long)(vm.phys_footprint >> 20) : 0, (unsigned long long)(os_proc_available_memory() >> 20),
++                (int)NSProcessInfo.processInfo.thermalState);
++        fflush(out);
++    }
++}
++}  // namespace
++
++void botw_perf_start(const char* docs) {
++    const std::string folder = docs;
++    if (FILE* off = fopen((folder + "/botw_perf_off").c_str(), "r")) {
++        fclose(off);
++        return;
++    }
++    const std::string path = folder + "/botw_perf.csv";
++    rename(path.c_str(), (folder + "/botw_perf_prev.csv").c_str());
++    FILE* out = fopen(path.c_str(), "w");
++    if (!out) return;
++    botw_perf::g_enabled.store(true, std::memory_order_relaxed);
++    std::thread(write_loop, out).detach();
++}
++#endif
 diff --git a/ios/src/split_ios.h b/ios/src/split_ios.h
 new file mode 100644
-index 0000000..1cca897
+index 0000000..0ee44b8
 --- /dev/null
 +++ b/ios/src/split_ios.h
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,33 @@
 +// The host built without generated/ (BOTW_SPLIT_HOST): loading Guest.framework, and the diagnostic.
 +#pragma once
 +#include <cstdint>
@@ -845,10 +920,286 @@ index 0000000..1cca897
 +bool botw_boot_safe_mode();
 +void botw_boot_end();
 +
++// Frame, compilation, GPU wait and audio measurements, written to <docs>/botw_perf.csv (perf_ios.mm).
++void botw_perf_start(const char* docs);
++
 +// One line that keeps apart what is only reserved (virtual) from what iOS counts against the app (footprint).
 +std::string botw_mem_line();
 +// Writes <docs>/botw_diag.txt line by line, so a kill leaves the last step reached. Returns a short summary.
 +std::string botw_diag_run(const char* docs, GuestLoad guest);
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.cpp
+index 53ac354..dba46ce 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.cpp
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.cpp
+@@ -1,6 +1,7 @@
+ #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
+ #include "Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.h"
+ #include "Cafe/HW/Latte/Renderer/Metal/LatteTextureMtl.h"
++#include "botw_perf.h"
+ 
+ LatteTextureReadbackInfoMtl::~LatteTextureReadbackInfoMtl()
+ {
+@@ -41,6 +42,7 @@ bool LatteTextureReadbackInfoMtl::IsFinished()
+ 
+ void LatteTextureReadbackInfoMtl::ForceFinish()
+ {
++    BOTW_PERF_SCOPE(g_wait_readback);
+     m_commandBuffer->waitUntilCompleted();
+ }
+ 
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp
+index 6193ab1..bba9f97 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp
+@@ -77,6 +77,7 @@ static RendererShaderMtl* rectsEmulationGS_generate(MetalRenderer* metalRenderer
+ {
+ 	std::string gsSrc;
+ 	gsSrc.append("#include <metal_stdlib>\r\n");
++#include "botw_perf.h"
+ 	gsSrc.append("using namespace metal;\r\n");
+ 
+ 	LatteShaderPSInputTable psInputTable;
+@@ -314,6 +315,9 @@ void MetalPipelineCompiler::InitFromState(const LatteFetchShader* fetchShader, c
+ 
+ bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool showInOverlay)
+ {
++#ifdef BOTW_SPLIT_HOST
++    botw_perf::Scoped botw_perf_compile(isRenderThread ? botw_perf::g_sync_pipeline : botw_perf::g_async_pipeline);
++#endif
+     if (m_usesGeometryShader && !m_mtlr->SupportsMeshShaders())
+         return false;
+ 
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
+index 51c61bc..6524dd3 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
+@@ -26,6 +26,7 @@
+ #define IMGUI_IMPL_METAL_CPP
+ #include "imgui/imgui_extension.h"
+ #include "imgui/imgui_impl_metal.h"
++#include "botw_perf.h"
+ 
+ #define EVENT_VALUE_WRAP 4096
+ 
+@@ -379,6 +380,7 @@ void MetalRenderer::DrawEmptyFrame(bool mainWindow)
+ 
+ void MetalRenderer::SwapBuffers(bool swapTV, bool swapDRC)
+ {
++    BOTW_PERF_FRAME();
+     if (swapTV)
+         SwapBuffer(true);
+     if (swapDRC)
+@@ -551,7 +553,10 @@ void MetalRenderer::Flush(bool waitIdle)
+         CommitCommandBuffer();
+ 
+     if (waitIdle && m_executingCommandBuffers.size() != 0)
++    {
++        BOTW_PERF_SCOPE(g_wait_idle);
+         m_executingCommandBuffers.back()->waitUntilCompleted();
++    }
+ }
+ 
+ void MetalRenderer::NotifyLatteCommandProcessorIdle()
+@@ -1631,7 +1636,10 @@ void MetalRenderer::occlusionQuery_destroy(LatteQueryObject* queryObj) {
+ 
+ void MetalRenderer::occlusionQuery_flush() {
+     if (m_occlusionQuery.m_lastCommandBuffer)
++    {
++        BOTW_PERF_SCOPE(g_wait_occlusion);
+         m_occlusionQuery.m_lastCommandBuffer->waitUntilCompleted();
++    }
+ }
+ 
+ void MetalRenderer::occlusionQuery_updateState() {
+@@ -1965,6 +1973,13 @@ void MetalRenderer::ProcessFinishedCommandBuffers()
+         auto commandBuffer = *it;
+         if (CommandBufferCompleted(commandBuffer))
+         {
++#ifdef BOTW_SPLIT_HOST
++            if (botw_perf::g_enabled.load(std::memory_order_relaxed))
++            {
++                botw_perf::g_gpu_ns.fetch_add((uint64_t)((commandBuffer->GPUEndTime() - commandBuffer->GPUStartTime()) * 1e9), std::memory_order_relaxed);
++                botw_perf::g_command_buffers.fetch_add(1, std::memory_order_relaxed);
++            }
++#endif
+             m_memoryManager->CleanupBuffers(commandBuffer);
+             commandBuffer->release();
+             it = m_executingCommandBuffers.erase(it);
+@@ -1989,6 +2004,7 @@ bool MetalRenderer::AcquireDrawable(bool mainWindow)
+         m_state.m_usesSRGB = latteBufferUsesSRGB;
+     }
+ 
++    BOTW_PERF_SCOPE(g_wait_drawable);
+     return layer.AcquireDrawable();
+ }
+ 
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp
+index f00af85..9aa7f43 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp
+@@ -8,6 +8,7 @@
+ #include "Common/precompiled.h"
+ #include "GameProfile/GameProfile.h"
+ #include "util/helpers/helpers.h"
++#include "botw_perf.h"
+ 
+ #define METAL_AIR_CACHE_NAME "Cemu_AIR_cache"
+ #define METAL_AIR_CACHE_PATH "/Volumes/" METAL_AIR_CACHE_NAME
+@@ -233,6 +234,9 @@ RendererShaderMtl::~RendererShaderMtl()
+ 
+ void RendererShaderMtl::PreponeCompilation(bool isRenderThread)
+ {
++#ifdef BOTW_SPLIT_HOST
++    botw_perf::Scoped botw_perf_shader(isRenderThread ? botw_perf::g_sync_shader : botw_perf::g_async_pipeline);
++#endif
+ 	shaderMtlThreadPool.s_compilationQueueMutex.lock();
+ 	bool isStillQueued = m_compilationState.hasState(COMPILATION_STATE::QUEUED);
+ 	if (isStillQueued)
+diff --git a/runtime/cemu_shims/botw_perf.h b/runtime/cemu_shims/botw_perf.h
+new file mode 100644
+index 0000000..cbd72f7
+--- /dev/null
++++ b/runtime/cemu_shims/botw_perf.h
+@@ -0,0 +1,139 @@
++// Light measurements for the split host (BOTW_SPLIT_HOST): only relaxed atomics on the hot paths, and nothing that
++// changes what the game does. A low-priority thread writes them out (ios/src/perf_ios.mm). Without BOTW_SPLIT_HOST
++// every macro is empty.
++#pragma once
++#ifdef BOTW_SPLIT_HOST
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++
++namespace botw_perf {
++inline uint64_t now_ns() {
++    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++inline std::atomic<bool> g_enabled{false};
++
++inline void raise_max(std::atomic<uint64_t>& slot, uint64_t value) {
++    uint64_t seen = slot.load(std::memory_order_relaxed);
++    while (value > seen && !slot.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
++    }
++}
++
++struct Counter {
++    std::atomic<uint64_t> count{0}, total_ns{0}, max_ns{0};
++    void add(uint64_t ns) {
++        count.fetch_add(1, std::memory_order_relaxed);
++        total_ns.fetch_add(ns, std::memory_order_relaxed);
++        raise_max(max_ns, ns);
++    }
++};
++
++inline Counter g_sync_pipeline, g_async_pipeline, g_sync_shader;   // Compilation
++inline Counter g_wait_idle, g_wait_occlusion, g_wait_readback, g_wait_drawable;   // The CPU waiting for the GPU
++inline std::atomic<uint64_t> g_gpu_ns{0}, g_command_buffers{0};
++
++// Frames, by upper bound in milliseconds. The last bucket takes everything above.
++constexpr int kBounds[] = {12, 17, 20, 25, 33, 50, 75, 100, 150, 250};
++constexpr int kBuckets = sizeof kBounds / sizeof kBounds[0] + 1;
++inline std::atomic<uint64_t> g_frame_buckets[kBuckets];
++inline std::atomic<uint64_t> g_frame_max_ns{0}, g_last_frame_ns{0};
++
++inline void add_frame(uint64_t ns) {
++    const uint64_t ms = ns / 1000000;
++    int i = 0;
++    while (i < kBuckets - 1 && ms >= (uint64_t)kBounds[i]) i++;
++    g_frame_buckets[i].fetch_add(1, std::memory_order_relaxed);
++    raise_max(g_frame_max_ns, ns);
++}
++
++inline void frame_presented() {
++    if (!g_enabled.load(std::memory_order_relaxed)) return;
++    const uint64_t now = now_ns();
++    const uint64_t last = g_last_frame_ns.exchange(now, std::memory_order_relaxed);
++    if (last) add_frame(now - last);
++}
++
++// Audio. "Empty" is the output queue found at zero by the AX thread, every 3 ms: it can miss a very short gap.
++inline std::atomic<uint64_t> g_audio_frames{0}, g_audio_empty{0}, g_audio_skips{0}, g_audio_gap_max_ns{0}, g_audio_work_max_ns{0};
++inline std::atomic<uint64_t> g_audio_queue_min{UINT64_MAX};
++inline std::atomic<bool> g_audio_was_empty{false};
++
++inline void audio_queue(uint64_t queued) {
++    if (!g_enabled.load(std::memory_order_relaxed)) return;
++    uint64_t seen = g_audio_queue_min.load(std::memory_order_relaxed);
++    while (queued < seen && !g_audio_queue_min.compare_exchange_weak(seen, queued, std::memory_order_relaxed)) {
++    }
++    const bool empty = queued == 0;
++    if (empty && !g_audio_was_empty.exchange(true, std::memory_order_relaxed)) g_audio_empty.fetch_add(1, std::memory_order_relaxed);
++    if (!empty) g_audio_was_empty.store(false, std::memory_order_relaxed);
++}
++
++class Scoped {
++   public:
++    explicit Scoped(Counter& counter) : counter_(g_enabled.load(std::memory_order_relaxed) ? &counter : nullptr), begin_(counter_ ? now_ns() : 0) {}
++    ~Scoped() {
++        if (counter_) counter_->add(now_ns() - begin_);
++    }
++    Scoped(const Scoped&) = delete;
++    Scoped& operator=(const Scoped&) = delete;
++
++   private:
++    Counter* counter_;
++    uint64_t begin_;
++};
++
++// The upper bound of the bucket holding this share of frames, 0 with no frame. It is a bound, not an exact time.
++inline int percentile_ms(const uint64_t* buckets, double share) {
++    uint64_t total = 0, seen = 0;
++    for (int i = 0; i < kBuckets; i++) total += buckets[i];
++    if (!total) return 0;
++    const uint64_t target = (uint64_t)(total * share + 0.999999);
++    for (int i = 0; i < kBuckets - 1; i++) {
++        seen += buckets[i];
++        if (seen >= target) return kBounds[i];
++    }
++    return 999;
++}
++
++inline uint64_t take(std::atomic<uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); }
++
++inline int write_counter(char* out, size_t room, Counter& c) {
++    const uint64_t n = take(c.count), total = take(c.total_ns), most = take(c.max_ns);
++    return snprintf(out, room, ",%llu,%.1f,%.1f", (unsigned long long)n, total / 1e6, most / 1e6);
++}
++
++constexpr const char* kHeader =
++    "t_s,frames,fps,p50_ms,p95_ms,p99_ms,max_ms,over33,over50,over100,"
++    "sync_pipe_n,sync_pipe_ms,sync_pipe_max,async_pipe_n,async_pipe_ms,async_pipe_max,sync_shader_n,sync_shader_ms,sync_shader_max,"
++    "idle_n,idle_ms,idle_max,occl_n,occl_ms,occl_max,readback_n,readback_ms,readback_max,drawable_n,drawable_ms,drawable_max,"
++    "gpu_ms,cmdbufs,audio_frames,audio_empty,audio_skips,audio_queue_min,audio_gap_max_ms,audio_work_max_ms";
++
++// One window of measurements as a CSV line, resetting the counters. Returns its length.
++inline int write_window(char* out, size_t room, double t_s, double window_s) {
++    uint64_t buckets[kBuckets], frames = 0;
++    for (int i = 0; i < kBuckets; i++) frames += (buckets[i] = take(g_frame_buckets[i]));
++    uint64_t over33 = 0, over50 = 0, over100 = 0;
++    for (int i = 0; i < kBuckets; i++) {
++        const int low = i ? kBounds[i - 1] : 0;
++        if (low >= 33) over33 += buckets[i];
++        if (low >= 50) over50 += buckets[i];
++        if (low >= 100) over100 += buckets[i];
++    }
++    int n = snprintf(out, room, "%.0f,%llu,%.1f,%d,%d,%d,%.1f,%llu,%llu,%llu", t_s, (unsigned long long)frames, frames / window_s, percentile_ms(buckets, 0.5), percentile_ms(buckets, 0.95),
++                     percentile_ms(buckets, 0.99), take(g_frame_max_ns) / 1e6, (unsigned long long)over33, (unsigned long long)over50, (unsigned long long)over100);
++    for (Counter* c : {&g_sync_pipeline, &g_async_pipeline, &g_sync_shader, &g_wait_idle, &g_wait_occlusion, &g_wait_readback, &g_wait_drawable}) n += write_counter(out + n, room - n, *c);
++    const uint64_t queue_min = g_audio_queue_min.exchange(UINT64_MAX, std::memory_order_relaxed);
++    n += snprintf(out + n, room - n, ",%.1f,%llu,%llu,%llu,%llu,%lld,%.1f,%.1f", take(g_gpu_ns) / 1e6, (unsigned long long)take(g_command_buffers), (unsigned long long)take(g_audio_frames),
++                  (unsigned long long)take(g_audio_empty), (unsigned long long)take(g_audio_skips), queue_min == UINT64_MAX ? -1LL : (long long)queue_min, take(g_audio_gap_max_ns) / 1e6, take(g_audio_work_max_ns) / 1e6);
++    return n;
++}
++}  // namespace botw_perf
++
++#define BOTW_PERF_SCOPE(counter) botw_perf::Scoped botw_perf_scope_##counter(botw_perf::counter)
++#define BOTW_PERF_FRAME() botw_perf::frame_presented()
++#else
++#define BOTW_PERF_SCOPE(counter)
++#define BOTW_PERF_FRAME()
++#endif
 diff --git a/runtime/include/guest_table.h b/runtime/include/guest_table.h
 index 782c4c3..1f1adc3 100644
 --- a/runtime/include/guest_table.h
@@ -948,3 +1299,68 @@ index 5b5932e..2e729d4 100644
 +    BOOT_STEP("host_loop_ended");
      return 0;
  }
+diff --git a/runtime/src/snd/ax_ist.cpp b/runtime/src/snd/ax_ist.cpp
+index d400b73..b9ef5b7 100644
+--- a/runtime/src/snd/ax_ist.cpp
++++ b/runtime/src/snd/ax_ist.cpp
+@@ -6,6 +6,7 @@
+ // AXOut_update timing) and calls guest callbacks with guest_call. Device remix matrices
+ // (AXSetDeviceRemixMatrix) are not imported by BotW and are left out.
+ #include <pthread.h>
++#include "../../cemu_shims/botw_perf.h"
+ 
+ #include <atomic>
+ #include <chrono>
+@@ -863,13 +864,30 @@ namespace snd_core
+ 				nextFrame += pacing < 0 ? kWaitDurationFast : (pacing > 0 ? kWaitDurationSlow : kWaitDuration);
+ 				auto now = clock::now();
+ 				if (now - nextFrame >= kTimeout)
++				{
+ 					nextFrame = now; // too far behind (stall, debugger): skip forward
++#ifdef BOTW_SPLIT_HOST
++					botw_perf::g_audio_skips.fetch_add(1, std::memory_order_relaxed);
++#endif
++				}
+ 				auto wakeTime = std::max(nextFrame, lastFrame + kWaitDurationMinimum);
+ 				if (s_istCond.wait_until(lock, wakeTime, [] { return s_istStopRequested; }))
+ 					break;
+ 				lock.unlock();
++#ifdef BOTW_SPLIT_HOST
++				const auto botw_perf_begin = clock::now();
++				if (botw_perf::g_enabled.load(std::memory_order_relaxed))
++				{
++					botw_perf::raise_max(botw_perf::g_audio_gap_max_ns, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(botw_perf_begin - lastFrame).count());
++					botw_perf::g_audio_frames.fetch_add(1, std::memory_order_relaxed);
++				}
++#endif
+ 				lastFrame = clock::now();
+ 				AXIst_GenerateFrame();
++#ifdef BOTW_SPLIT_HOST
++				if (botw_perf::g_enabled.load(std::memory_order_relaxed))
++					botw_perf::raise_max(botw_perf::g_audio_work_max_ns, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - botw_perf_begin).count());
++#endif
+ 				numProcessedFrames++;
+ 				lock.lock();
+ 			}
+diff --git a/runtime/src/snd/ax_out.cpp b/runtime/src/snd/ax_out.cpp
+index ebb7299..59aa3d0 100644
+--- a/runtime/src/snd/ax_out.cpp
++++ b/runtime/src/snd/ax_out.cpp
+@@ -6,6 +6,7 @@
+ // AXOut_update does lives in the AX thread (ax_ist.cpp) and only asks this file for a device hint.
+ // The remote speaker API (AXRmt*) reports no samples.
+ #include "../audio/output.h"
++#include "../../cemu_shims/botw_perf.h"
+ #include "ax.h"
+ #include "ax_internal.h"
+ 
+@@ -310,6 +311,9 @@ namespace snd_core
+ 			s_deviceActive = true;
+ 		if (!s_deviceActive)
+ 			return 0;
++#ifdef BOTW_SPLIT_HOST
++		botw_perf::audio_queue((uint64_t)queued);
++#endif
+ 		if (queued < kLowWaterFrames)
+ 			return -1;
+ 		if (queued > kHighWaterFrames)
