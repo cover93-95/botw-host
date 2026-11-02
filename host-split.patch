@@ -1,0 +1,549 @@
+diff --git a/ios/CMakeLists.txt b/ios/CMakeLists.txt
+index b0c511d..761a8ba 100644
+--- a/ios/CMakeLists.txt
++++ b/ios/CMakeLists.txt
+@@ -39,6 +39,11 @@ find_package(zstd REQUIRED CONFIG PATHS ${DEPS}/lib/cmake/zstd NO_DEFAULT_PATH)
+ # A14 == M1 ISA (armv8.5-a), so the guest code is compiled for the same features as on macOS.
+ set(BOTW_CPU -mcpu=apple-a14)
+ 
++# BOTW_SPLIT_HOST: build the app without generated/. The guest code is a Guest.framework built elsewhere
++# from the player's own game files and added to the app before signing (ios/src/guest_ios.mm).
++option(BOTW_SPLIT_HOST "Build the host alone, with no recompiled guest code" OFF)
++
++if(NOT BOTW_SPLIT_HOST)
+ # ---- recompiled guest code (same flags as the macOS build) ----------------------------------
+ file(GLOB GUEST_SOURCES CONFIGURE_DEPENDS
+   ${ROOT}/generated/fn_*.cpp ${ROOT}/generated/big_*.cpp ${ROOT}/generated/huge_*.cpp
+@@ -51,6 +56,7 @@ file(GLOB BIG_SOURCES CONFIGURE_DEPENDS ${ROOT}/generated/big_*.cpp)
+ file(GLOB HUGE_SOURCES CONFIGURE_DEPENDS ${ROOT}/generated/huge_*.cpp)
+ set_source_files_properties(${BIG_SOURCES} PROPERTIES COMPILE_OPTIONS "-O1")
+ set_source_files_properties(${HUGE_SOURCES} PROPERTIES COMPILE_OPTIONS "-O0")
++endif()
+ 
+ # ---- vendored Cemu Latte GPU + shims ---------------------------------------------------------
+ file(GLOB_RECURSE CEMU_SOURCES CONFIGURE_DEPENDS
+@@ -86,8 +92,15 @@ file(GLOB IOS_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.mm ${C
+ # main.cpp's main() becomes botw_main(); ios/src/main_ios.mm owns main() (UIApplicationMain via SDL)
+ set_source_files_properties(${ROOT}/runtime/src/main.cpp PROPERTIES COMPILE_DEFINITIONS "main=botw_main")
+ # CEMU_SOURCES with the AppKit view excluded need a CreateMetalLayer: ios/src/MetalLayer_ios.mm
+-add_executable(BotWRecomp MACOSX_BUNDLE ${RUNTIME_SOURCES} ${IOS_SOURCES}
+-  $<TARGET_OBJECTS:guest> $<TARGET_OBJECTS:cemu_gpu>)
++if(BOTW_SPLIT_HOST)
++  add_executable(BotWRecomp MACOSX_BUNDLE ${RUNTIME_SOURCES} ${IOS_SOURCES} $<TARGET_OBJECTS:cemu_gpu>)
++  target_compile_definitions(BotWRecomp PRIVATE BOTW_SPLIT_HOST)
++  # Guest.framework binds the runtime's rt_*, hle_* and hook_* symbols at load.
++  target_link_options(BotWRecomp PRIVATE -Wl,-export_dynamic)
++else()
++  add_executable(BotWRecomp MACOSX_BUNDLE ${RUNTIME_SOURCES} ${IOS_SOURCES}
++    $<TARGET_OBJECTS:guest> $<TARGET_OBJECTS:cemu_gpu>)
++endif()
+ target_include_directories(BotWRecomp PRIVATE ${ROOT}/runtime/include ${ROOT}/runtime/src ${ROOT}/generated
+ )
+ target_compile_options(BotWRecomp PRIVATE -Wall -Wno-unused-function -Wno-unused-variable -fwrapv ${BOTW_CPU}
+diff --git a/ios/src/diag_ios.mm b/ios/src/diag_ios.mm
+new file mode 100644
+index 0000000..e0594fc
+--- /dev/null
++++ b/ios/src/diag_ios.mm
+@@ -0,0 +1,300 @@
++// What the phone really allows, measured before any game code runs (BOTW_SPLIT_HOST). See split_ios.h.
++//
++// Three numbers are kept apart on purpose. Virtual: address space taken, which reserving raises and which costs no
++// memory. Resident: pages currently mapped in, clean ones included, which iOS can drop. Footprint: what iOS counts
++// against the app's limit, the number jetsam acts on.
++#ifdef BOTW_SPLIT_HOST
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++#import <UIKit/UIKit.h>
++#include <fcntl.h>
++#include <mach/mach.h>
++#include <os/proc.h>
++#include <pthread.h>
++#include <sys/mman.h>
++#include <sys/sysctl.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "split_ios.h"
++
++namespace {
++const size_t kMiB = 1ull << 20, kGiB = 1ull << 30;
++const size_t kGuestSpace = (1ull << 32) + 0x10000;  // runtime/src/mem.cpp
++const size_t kPage = 16 * 1024;
++const int kFlags = MAP_ANON | MAP_PRIVATE | MAP_NORESERVE;
++const int kGuestThreads = 40;                       // ios/PORTING.md: about 40 guest threads
++const size_t kCappedStack = 16 * kMiB;              // ios/src/vm_ios.cpp, without extended addressing
++
++struct Mem {
++    uint64_t virt = 0, resident = 0, footprint = 0, available = 0;
++};
++
++Mem read_mem() {
++    Mem m;
++    task_vm_info_data_t vm;
++    mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
++    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &n) == KERN_SUCCESS) {
++        m.virt = vm.virtual_size;
++        m.resident = vm.resident_size;
++        m.footprint = vm.phys_footprint;
++    }
++    m.available = os_proc_available_memory();
++    return m;
++}
++
++std::string mem_text(const Mem& m) {
++    char s[160];
++    snprintf(s, sizeof s, "virtual %llu MiB, resident %llu MiB, footprint %llu MiB, available %llu MiB",
++             (unsigned long long)(m.virt / kMiB), (unsigned long long)(m.resident / kMiB),
++             (unsigned long long)(m.footprint / kMiB), (unsigned long long)(m.available / kMiB));
++    return s;
++}
++
++long long delta_mib(uint64_t after, uint64_t before) { return ((long long)after - (long long)before) / (long long)kMiB; }
++
++class Report {
++   public:
++    explicit Report(const char* docs) {
++        std::string path = std::string(docs) + "/botw_diag.txt";
++        fd_ = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    }
++    ~Report() {
++        if (fd_ >= 0) close(fd_);
++    }
++    void line(const char* format, ...) __attribute__((format(printf, 2, 3))) {
++        char s[512];
++        va_list a;
++        va_start(a, format);
++        int n = vsnprintf(s, sizeof s - 1, format, a);
++        va_end(a);
++        if (n < 0) return;
++        n = std::min(n, (int)sizeof s - 2);
++        s[n] = '\n';
++        if (fd_ >= 0) {
++            (void)!write(fd_, s, n + 1);
++            fsync(fd_);  // A jetsam kill must leave the last step reached.
++        }
++    }
++    // A checked result: goes to the summary, and FAIL or WARN decide the verdict.
++    void result(const char* name, const char* status, const std::string& detail) {
++        line("RESULT %s %s: %s", name, status, detail.c_str());
++        summary_ += std::string(name) + ": " + status + "\n";
++        if (!strcmp(status, "FAIL")) failed_ = true;
++        if (!strcmp(status, "WARN")) warned_ = true;
++    }
++    std::string finish() {
++        const char* verdict = failed_ ? "FAIL" : warned_ ? "WARN" : "PASS";
++        line("RESULT DIAG %s", verdict);
++        return summary_ + "\nDIAG " + verdict + "\nDetails: botw_diag.txt in the app's files.";
++    }
++
++   private:
++    int fd_ = -1;
++    bool failed_ = false, warned_ = false;
++    std::string summary_;
++};
++
++bool reservable(size_t size, int prot = PROT_NONE) {
++    void* p = mmap(nullptr, size, prot, kFlags, -1, 0);
++    if (p == MAP_FAILED) return false;
++    munmap(p, size);
++    return true;
++}
++
++// The largest single reservation, to 64 MiB. Touches nothing.
++size_t largest_reservation(size_t limit) {
++    size_t lo = 0, hi = limit;
++    if (reservable(hi)) return hi;
++    while (hi - lo > 64 * kMiB) {
++        size_t mid = ((lo + hi) / 2) & ~(64 * kMiB - 1);
++        if (mid <= lo) break;
++        (reservable(mid) ? lo : hi) = mid;
++    }
++    return lo;
++}
++
++// What the running app would still find, by taking 64 MiB pieces until none is left. Released before it returns.
++size_t remaining_address_space(size_t limit) {
++    std::vector<void*> pieces;
++    while (pieces.size() * 64 * kMiB < limit) {
++        void* p = mmap(nullptr, 64 * kMiB, PROT_NONE, kFlags, -1, 0);
++        if (p == MAP_FAILED) break;
++        pieces.push_back(p);
++    }
++    for (void* p : pieces) munmap(p, 64 * kMiB);
++    return pieces.size() * 64 * kMiB;
++}
++
++bool profile_grants(const char* entitlement, bool& has_profile) {
++    NSString* path = [NSBundle.mainBundle pathForResource:@"embedded" ofType:@"mobileprovision"];
++    NSData* data = path ? [NSData dataWithContentsOfFile:path] : nil;
++    has_profile = data != nil;
++    if (!data) return false;
++    return [data rangeOfData:[NSData dataWithBytes:entitlement length:strlen(entitlement)] options:0
++                       range:NSMakeRange(0, data.length)].location != NSNotFound;
++}
++
++// Threads with the stack size the runtime would give guest threads, parked until released.
++struct Parked {
++    pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++    pthread_cond_t go = PTHREAD_COND_INITIALIZER;
++    bool release = false;
++};
++
++void* park(void* arg) {
++    auto* parked = (Parked*)arg;
++    pthread_mutex_lock(&parked->lock);
++    while (!parked->release) pthread_cond_wait(&parked->go, &parked->lock);
++    pthread_mutex_unlock(&parked->lock);
++    return nullptr;
++}
++}  // namespace
++
++std::string botw_mem_line() { return mem_text(read_mem()); }
++
++std::string botw_diag_run(const char* docs, GuestLoad guest) {
++    Report r(docs);
++    r.line("BotW host diagnostic. No game code ran.");
++
++    char model[64] = {};
++    size_t len = sizeof model;
++    sysctlbyname("hw.machine", model, &len, nullptr, 0);
++    uint64_t memsize = 0;
++    len = sizeof memsize;
++    sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0);
++    r.line("device %s, iOS %s, RAM %llu MiB", model, UIDevice.currentDevice.systemVersion.UTF8String,
++           (unsigned long long)(memsize / kMiB));
++    r.line("MEM launch: %s", botw_mem_line().c_str());
++
++    bool has_profile = false;
++    const bool memory_limit = profile_grants("com.apple.developer.kernel.increased-memory-limit", has_profile);
++    const bool extended_va = profile_grants("com.apple.developer.kernel.extended-virtual-addressing", has_profile);
++    r.line("profile %s, increased-memory-limit %s, extended-virtual-addressing %s", has_profile ? "present" : "absent",
++           memory_limit ? "granted" : "not granted", extended_va ? "granted" : "not granted");
++    if (!memory_limit) r.result("MEMORY_LIMIT", "WARN", "the profile does not grant the increased memory limit");
++
++    // ---- Guest.framework ------------------------------------------------------------------------
++    uint64_t base = 0, size = 0;
++    botw_guest_image(base, size);
++    switch (guest) {
++        case GuestLoad::None:
++            r.result("GUEST", "WARN", "no Guest.framework in this app, so its place in memory was not tested");
++            break;
++        case GuestLoad::Failed:
++            r.result("GUEST", "FAIL", botw_guest_error());
++            break;
++        case GuestLoad::Game:  // Not reached: main_ios.mm runs the game instead.
++            break;
++        case GuestLoad::Fixture: {
++            char s[128];
++            snprintf(s, sizeof s, "loaded at 0x%llx, %llu MiB", (unsigned long long)base, (unsigned long long)(size / kMiB));
++            std::string test;
++            const bool ok = botw_guest_fixture_test(test);
++            r.result("GUEST", ok ? "PASS" : "FAIL", std::string(s) + ", round trip " + test);
++            break;
++        }
++    }
++    r.line("MEM after the framework: %s", botw_mem_line().c_str());
++
++    // ---- Address space, nothing touched ---------------------------------------------------------
++    const size_t largest = largest_reservation(64 * kGiB);
++    r.line("largest single reservation %llu MiB", (unsigned long long)(largest / kMiB));
++    r.line("extended address space (a 32 GiB reservation) %s", reservable(32 * kGiB) ? "yes" : "no");
++
++    // ---- The guest space, exactly as runtime/src/mem.cpp maps it ---------------------------------
++    const Mem before = read_mem();
++    void* space = mmap(nullptr, kGuestSpace, PROT_READ | PROT_WRITE, kFlags, -1, 0);
++    if (space == MAP_FAILED) {
++        r.result("VA4G", "FAIL", "the 4 GiB guest space cannot be reserved: " + std::string(strerror(errno)));
++        return r.finish();
++    }
++    const Mem reserved = read_mem();
++    const long long virt_delta = delta_mib(reserved.virt, before.virt);
++    const long long reserve_cost = delta_mib(reserved.footprint, before.footprint);
++    char s[192];
++    snprintf(s, sizeof s, "at %p, virtual +%lld MiB, footprint %+lld MiB", space, virt_delta, reserve_cost);
++    r.result("VA4G", virt_delta >= 4096 && reserve_cost < 16 ? "PASS" : "WARN", s);
++    r.line("MEM guest space reserved: %s", botw_mem_line().c_str());
++
++    // ---- Touching it, which is what costs memory ----------------------------------------------
++    const size_t touched = 64 * kMiB;
++    auto* bytes = (uint8_t*)space;
++    const size_t stride = (kGuestSpace - kPage) / (touched / kPage);
++    size_t count = 0;
++    for (size_t at = kPage; at + kPage <= kGuestSpace && count < touched / kPage; at += stride, count++)
++        bytes[at & ~(kPage - 1)] = (uint8_t)(count | 1);
++    bool intact = true;
++    count = 0;
++    for (size_t at = kPage; at + kPage <= kGuestSpace && count < touched / kPage; at += stride, count++)
++        intact = intact && bytes[at & ~(kPage - 1)] == (uint8_t)(count | 1);
++    const Mem written = read_mem();
++    const long long touch_cost = delta_mib(written.footprint, reserved.footprint);
++    snprintf(s, sizeof s, "%llu pages across the space read back %s, footprint %+lld MiB for %llu MiB touched",
++             (unsigned long long)count, intact ? "intact" : "WRONG", touch_cost, (unsigned long long)(touched / kMiB));
++    r.result("TOUCH", intact && touch_cost >= 32 && touch_cost <= 128 ? "PASS" : "WARN", s);
++    r.line("MEM pages touched: %s", botw_mem_line().c_str());
++
++    // ---- What the running game also needs in address space ------------------------------------
++    Parked parked;
++    std::vector<pthread_t> threads;
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, kCappedStack);
++    for (int i = 0; i < kGuestThreads; i++) {
++        pthread_t t;
++        if (pthread_create(&t, &attr, park, &parked)) break;
++        threads.push_back(t);
++    }
++    pthread_attr_destroy(&attr);
++    snprintf(s, sizeof s, "%zu of %d threads with %llu MiB stacks", threads.size(), kGuestThreads,
++             (unsigned long long)(kCappedStack / kMiB));
++    r.result("STACKS", (int)threads.size() == kGuestThreads ? "PASS" : "FAIL", s);
++    r.line("MEM threads parked: %s", botw_mem_line().c_str());
++
++    const size_t left = remaining_address_space(16 * kGiB);
++    const size_t left_single = largest_reservation(16 * kGiB);
++    snprintf(s, sizeof s, "%llu MiB left in all, %llu MiB in one piece", (unsigned long long)(left / kMiB),
++             (unsigned long long)(left_single / kMiB));
++    // ios/PORTING.md expects "well under 1 GB" without extended addressing, and that build ran. A warning to weigh, not a limit.
++    r.result("VA_LEFT", left >= 1 * kGiB ? "PASS" : "WARN", s);
++
++    // ---- Metal, with all of that held ----------------------------------------------------------
++    @autoreleasepool {
++        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++        if (!device) {
++            r.result("METAL", "FAIL", "no Metal device");
++        } else {
++            r.line("GPU %s, BC textures %d, unified memory %d, recommended working set %llu MiB", device.name.UTF8String,
++                   (int)device.supportsBCTextureCompression, (int)device.hasUnifiedMemory,
++                   (unsigned long long)(device.recommendedMaxWorkingSetSize / kMiB));
++            const Mem pre = read_mem();
++            id<MTLBuffer> buffer = [device newBufferWithLength:512 * kMiB options:MTLResourceStorageModeShared];
++            const Mem post = read_mem();
++            snprintf(s, sizeof s, "512 MiB shared buffer %s, virtual %+lld MiB, footprint %+lld MiB",
++                     buffer ? "created" : "REFUSED", delta_mib(post.virt, pre.virt), delta_mib(post.footprint, pre.footprint));
++            r.result("METAL", buffer && device.supportsBCTextureCompression ? "PASS" : "WARN", s);
++            buffer = nil;
++        }
++    }
++
++    // ---- Release everything, and check the memory comes back -----------------------------------
++    pthread_mutex_lock(&parked.lock);
++    parked.release = true;
++    pthread_cond_broadcast(&parked.go);
++    pthread_mutex_unlock(&parked.lock);
++    for (pthread_t t : threads) pthread_join(t, nullptr);
++    munmap(space, kGuestSpace);
++    const Mem end = read_mem();
++    r.line("MEM all released: %s", mem_text(end).c_str());
++    r.line("headroom at launch to compare with the game's use: available %llu MiB", (unsigned long long)(end.available / kMiB));
++    return r.finish();
++}
++#endif
+diff --git a/ios/src/guest_ios.mm b/ios/src/guest_ios.mm
+new file mode 100644
+index 0000000..817c4d6
+--- /dev/null
++++ b/ios/src/guest_ios.mm
+@@ -0,0 +1,93 @@
++// Loads Guest.framework into a host built without generated/ (BOTW_SPLIT_HOST). See split_ios.h.
++#ifdef BOTW_SPLIT_HOST
++#import <Foundation/Foundation.h>
++#include <dlfcn.h>
++#include <mach-o/dyld.h>
++#include <mach-o/loader.h>
++
++#include <algorithm>
++#include <cstring>
++#include <string>
++
++#include "guest_table.h"
++#include "split_ios.h"
++
++const GuestFnEntry* g_split_functions = nullptr;
++uint32_t g_split_function_count = 0;
++const GuestImportEntry* g_split_imports = nullptr;
++uint32_t g_split_import_count = 0;
++
++namespace {
++std::string g_error;
++void* g_handle = nullptr;
++uint64_t g_base = 0, g_size = 0;
++
++GuestLoad fail(const std::string& why) {
++    g_error = why;
++    return GuestLoad::Failed;
++}
++
++void measure(const void* address) {
++    Dl_info info = {};
++    if (!dladdr(address, &info) || !info.dli_fbase) return;
++    g_base = (uint64_t)info.dli_fbase;
++    auto* header = (const mach_header_64*)info.dli_fbase;
++    auto* cmd = (const load_command*)(header + 1);
++    uint64_t lo = UINT64_MAX, hi = 0;
++    for (uint32_t i = 0; i < header->ncmds; i++, cmd = (const load_command*)((const char*)cmd + cmd->cmdsize)) {
++        if (cmd->cmd != LC_SEGMENT_64) continue;
++        auto* seg = (const segment_command_64*)cmd;
++        if (!strcmp(seg->segname, "__PAGEZERO")) continue;
++        lo = std::min(lo, seg->vmaddr);
++        hi = std::max(hi, seg->vmaddr + seg->vmsize);
++    }
++    if (hi > lo) g_size = hi - lo;
++}
++}  // namespace
++
++const std::string& botw_guest_error() { return g_error; }
++
++void botw_guest_image(uint64_t& base, uint64_t& size) {
++    base = g_base;
++    size = g_size;
++}
++
++// The fixture calls this to prove that a framework binds a host symbol at load.
++extern "C" uint32_t botw_split_ping(uint32_t v) { return v ^ 0x5A5AA5A5u; }
++
++GuestLoad botw_guest_load() {
++    NSString* path = [NSBundle.mainBundle.privateFrameworksPath stringByAppendingPathComponent:@"Guest.framework/Guest"];
++    if (![NSFileManager.defaultManager fileExistsAtPath:path]) return GuestLoad::None;
++    g_handle = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
++    if (!g_handle) return fail(dlerror());
++
++    auto* functions = (const GuestFnEntry*)dlsym(g_handle, "g_guest_functions");
++    auto* function_count = (const uint32_t*)dlsym(g_handle, "g_guest_function_count");
++    auto* imports = (const GuestImportEntry*)dlsym(g_handle, "g_guest_imports");
++    auto* import_count = (const uint32_t*)dlsym(g_handle, "g_guest_import_count");
++    if (!functions || !function_count || !imports || !import_count) return fail("Guest.framework lacks a table");
++    if (!*function_count) return fail("Guest.framework has no function");
++
++    g_split_functions = functions;
++    g_split_function_count = *function_count;
++    g_split_imports = imports;
++    g_split_import_count = *import_count;
++    measure(functions);
++    return dlsym(g_handle, "botw_guest_is_fixture") ? GuestLoad::Fixture : GuestLoad::Game;
++}
++
++bool botw_guest_fixture_test(std::string& out) {
++    using Test = uint32_t (*)(uint32_t);
++    auto test = g_handle ? (Test)dlsym(g_handle, "botw_guest_fixture_test") : nullptr;
++    if (!test) {
++        out = "no test function";
++        return false;
++    }
++    // Crosses the pad twice, and calls back into the host: see fixture.cpp for the expected value.
++    const uint32_t got = test(0x01020304u), want = (0x01020304u ^ 0x5A5AA5A5u) + 1;
++    char line[96];
++    snprintf(line, sizeof line, "returned 0x%08x, expected 0x%08x", got, want);
++    out = line;
++    return got == want;
++}
++#endif
+diff --git a/ios/src/main_ios.mm b/ios/src/main_ios.mm
+index dee5dcb..82e098d 100644
+--- a/ios/src/main_ios.mm
++++ b/ios/src/main_ios.mm
+@@ -15,6 +15,9 @@
+ #include <vector>
+ 
+ #include "log.h"
++#ifdef BOTW_SPLIT_HOST
++#include "split_ios.h"
++#endif
+ 
+ int botw_main(int argc, char** argv);
+ 
+@@ -58,8 +61,12 @@ void start_stats_thread(std::string device) {
+             std::this_thread::sleep_for(std::chrono::seconds(first ? 2 : 10));
+             if (first) LOG("%s", device.c_str());  // the log file is open by now
+             first = false;
++#ifdef BOTW_SPLIT_HOST
++            LOG("ios: %s", botw_mem_line().c_str());
++#else
+             LOG("ios: footprint %llu MB, available before jetsam %llu MB",
+                 (unsigned long long)(footprint_bytes() >> 20), (unsigned long long)(os_proc_available_memory() >> 20));
++#endif
+         }
+     }).detach();
+ }
+@@ -79,6 +86,21 @@ int ios_main(int argc, char** argv) {
+     [kReadme writeToFile:[docs stringByAppendingPathComponent:@"README.txt"] atomically:YES
+                 encoding:NSUTF8StringEncoding error:nil];
+ 
++#ifdef BOTW_SPLIT_HOST
++    // Before mem::init: the framework has to take its place below the shared cache, because the 4 GB guest space
++    // only fits above it. With no game code in the app there is only the diagnostic to run.
++    const GuestLoad guest = botw_guest_load();
++    if (guest != GuestLoad::Game) {
++        const std::string summary = botw_diag_run(docs.UTF8String, guest);
++        const SDL_MessageBoxButtonData done[] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "OK"}};
++        const SDL_MessageBoxData box = {SDL_MESSAGEBOX_INFORMATION, nullptr, "BotW host diagnostic", summary.c_str(),
++                                        1, done, nullptr};
++        int pressed = 0;
++        SDL_ShowMessageBox(&box, &pressed);
++        return 0;
++    }
++#endif
++
+     std::vector<std::string> args(argv, argv + argc);
+     bool has_game_arg = false;
+     for (auto& a : args) has_game_arg |= a == "--game";
+diff --git a/ios/src/split_ios.h b/ios/src/split_ios.h
+new file mode 100644
+index 0000000..9175609
+--- /dev/null
++++ b/ios/src/split_ios.h
+@@ -0,0 +1,23 @@
++// The host built without generated/ (BOTW_SPLIT_HOST): loading Guest.framework, and the diagnostic.
++#pragma once
++#include <cstdint>
++#include <string>
++
++enum class GuestLoad {
++    None,     // no Guest.framework in the app
++    Failed,   // it is there and dlopen or a table failed: the reason is in botw_guest_error()
++    Fixture,  // the test framework, which holds no game code
++    Game,
++};
++
++GuestLoad botw_guest_load();
++const std::string& botw_guest_error();
++// Runs the fixture's round trip through the host. False when it failed; `out` says why.
++bool botw_guest_fixture_test(std::string& out);
++// Where the framework's code landed, and its size in memory. 0 when none is loaded.
++void botw_guest_image(uint64_t& base, uint64_t& size);
++
++// One line that keeps apart what is only reserved (virtual) from what iOS counts against the app (footprint).
++std::string botw_mem_line();
++// Writes <docs>/botw_diag.txt line by line, so a kill leaves the last step reached. Returns a short summary.
++std::string botw_diag_run(const char* docs, GuestLoad guest);
+diff --git a/runtime/include/guest_table.h b/runtime/include/guest_table.h
+index 782c4c3..1f1adc3 100644
+--- a/runtime/include/guest_table.h
++++ b/runtime/include/guest_table.h
+@@ -14,7 +14,19 @@ struct GuestImportEntry {
+     GuestFn fn;  // HLE implementation (function imports)
+ };
+ 
++#ifdef BOTW_SPLIT_HOST
++// The host is built without generated/: these come from Guest.framework at launch (ios/src/guest_ios.mm).
++extern const GuestFnEntry* g_split_functions;
++extern uint32_t g_split_function_count;
++extern const GuestImportEntry* g_split_imports;
++extern uint32_t g_split_import_count;
++#define g_guest_functions g_split_functions
++#define g_guest_function_count g_split_function_count
++#define g_guest_imports g_split_imports
++#define g_guest_import_count g_split_import_count
++#else
+ extern const GuestFnEntry g_guest_functions[];
+ extern const uint32_t g_guest_function_count;
+ extern const GuestImportEntry g_guest_imports[];
+ extern const uint32_t g_guest_import_count;
++#endif

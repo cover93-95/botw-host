@@ -1,0 +1,19 @@
+# Nothing of a game ever belongs here. check_public.py refuses these too.
+generated/
+game/
+obj/
+build/
+out/
+Guest.framework/
+*.rpx
+*.rpl
+*.wud
+*.wux
+*.key
+*.keys
+*.tik
+*.tmd
+*.h3
+*.ipa
+*.app
+*.o
