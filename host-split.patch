@@ -828,10 +828,10 @@ index dee5dcb..42f7165 100644
      cargv.push_back(nullptr);
 diff --git a/ios/src/perf_ios.mm b/ios/src/perf_ios.mm
 new file mode 100644
-index 0000000..35aaaa4
+index 0000000..29bd311
 --- /dev/null
 +++ b/ios/src/perf_ios.mm
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,275 @@
 +// Writes the measurements of cemu_shims/botw_perf.h every 5 s from a low-priority thread, one folder per run, in
 +// <Documents>/perf/<date-time>/: frames.csv, spikes.csv (each long frame and what held it up), threads.csv (CPU time by
 +// thread name) and meta.txt. perf/perf_report.py reads them. <Documents>/botw_tune.txt chooses the level: perf=full,
@@ -1100,6 +1100,7 @@ index 0000000..35aaaa4
 +    // writer thread sets the final level after its calibration, which needs it on too.
 +    botw_perf::g_enabled.store(full, std::memory_order_relaxed);
 +    botw_perf::g_locks_on.store(full && botw_tune::enabled("diag_locks"), std::memory_order_relaxed);
++    botw_perf::g_gpu_diag.store(full && botw_tune::enabled("diag_gpu"), std::memory_order_relaxed);
 +    std::thread(write_loop, files, full).detach();
 +    if (const long stall_ms = botw_tune::integer(botw_tune::current(), "diag_stall_ms", 0, 0, 1000)) {
 +        if (FILE* stalls = fopen((path + "/stalls.csv").c_str(), "w")) std::thread(stall_loop, stalls, (uint64_t)stall_ms * 1000000, botw_tune::enabled("diag_stall_stacks")).detach();
@@ -1145,8 +1146,53 @@ index 0000000..0ee44b8
 +std::string botw_mem_line();
 +// Writes <docs>/botw_diag.txt line by line, so a kill leaves the last step reached. Returns a short summary.
 +std::string botw_diag_run(const char* docs, GuestLoad guest);
+diff --git a/runtime/cemu/Cafe/HW/Latte/Core/LatteBufferCache.cpp b/runtime/cemu/Cafe/HW/Latte/Core/LatteBufferCache.cpp
+index a561a20..01b9c16 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Core/LatteBufferCache.cpp
++++ b/runtime/cemu/Cafe/HW/Latte/Core/LatteBufferCache.cpp
+@@ -1,6 +1,7 @@
+ #include "Cafe/HW/Latte/Renderer/Renderer.h"
+ #include "util/ChunkedHeap/ChunkedHeap.h"
+ #include "util/helpers/fspinlock.h"
++#include "botw_perf.h"
+ #include "config/ActiveSettings.h"
+ 
+ #define CACHE_PAGE_SIZE		0x400
+@@ -1333,6 +1334,9 @@ private:
+ 		static const uint64 k2 = 0xF7431F49;
+ 		static const uint64 k3 = 0xA4C7AE9D;
+ 
++#ifdef BOTW_SPLIT_HOST
++		botw_perf::g_pages_hashed.fetch_add(1, std::memory_order_relaxed);
++#endif
+ 		cemu_assert_debug((CACHE_PAGE_SIZE % 32) == 0);
+ 		const uint64* ptr = (const uint64*)mem;
+ 		const uint64* end = ptr + (CACHE_PAGE_SIZE / sizeof(uint64));
+@@ -1703,7 +1707,22 @@ void LatteBufferCache_notifyDCFlush(MPTR address, uint32 size)
+ 
+ 	uint32 firstPage = address / CACHE_PAGE_SIZE;
+ 	uint32 lastPage = (address + size - 1) / CACHE_PAGE_SIZE;
++#ifdef BOTW_SPLIT_HOST
++	if (botw_perf::g_locks_on.load(std::memory_order_relaxed))
++	{
++		botw_perf::g_dc_flushes.fetch_add(1, std::memory_order_relaxed);
++		botw_perf::g_dc_pages.fetch_add(lastPage - firstPage + 1, std::memory_order_relaxed);
++		if (!g_spinlockDCFlushQueue.try_lock())
++		{
++			botw_perf::g_dc_contended.fetch_add(1, std::memory_order_relaxed);
++			g_spinlockDCFlushQueue.lock();
++		}
++	}
++	else
++		g_spinlockDCFlushQueue.lock();
++#else
+ 	g_spinlockDCFlushQueue.lock();
++#endif
+ 	for (uint32 i = firstPage; i <= lastPage; i++)
+ 		s_DCFlushQueue->Set(i);
+ 	g_spinlockDCFlushQueue.unlock();
 diff --git a/runtime/cemu/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/runtime/cemu/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
-index 44e3a76..0aaff30 100644
+index 44e3a76..8bcaa9a 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 +++ b/runtime/cemu/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
 @@ -10,6 +10,8 @@
@@ -1190,6 +1236,22 @@ index 44e3a76..0aaff30 100644
  		}
  		performanceMonitor.gpuTime_fenceTime.endMeasuring();
  	}
+@@ -639,6 +652,7 @@ LatteCMDPtr LatteCP_itMemSemaphore(LatteCMDPtr cmd, uint32 nWords)
+ 	{
+ 		// wait
+ 		LatteCP_signalEnterWait();
++		BOTW_PERF_SCOPE(g_gpu_semaphore);
+ 		size_t loopCount = 0;
+ 		while (true)
+ 		{
+@@ -969,6 +983,7 @@ LatteCMDPtr LatteCP_itHLEWaitForFlip(LatteCMDPtr cmd, uint32 nWords)
+ 	cemu_assert_debug(nWords == 1);
+ 	MPTR reserved1 = LatteReadCMD(); // reserved
+ 	// wait for flip
++	BOTW_PERF_SCOPE(g_gpu_flip_wait);
+ 	uint32 currentFlipCount = LatteGPUState.flipCounter;
+ 	while (true)
+ 	{
 diff --git a/runtime/cemu/Cafe/HW/Latte/Core/LatteThread.cpp b/runtime/cemu/Cafe/HW/Latte/Core/LatteThread.cpp
 index ceedc92..ebb271b 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Core/LatteThread.cpp
@@ -1232,6 +1294,65 @@ index 53ac354..dba46ce 100644
      m_commandBuffer->waitUntilCompleted();
  }
  
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalDepthStencilCache.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalDepthStencilCache.cpp
+index 1fe680b..87b1466 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalDepthStencilCache.cpp
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalDepthStencilCache.cpp
+@@ -1,3 +1,5 @@
++#include "botw_perf.h"
++#include "botw_tune.h"
+ #include "Cafe/HW/Latte/Renderer/Metal/MetalDepthStencilCache.h"
+ #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
+ #include "HW/Latte/ISA/RegDefines.h"
+@@ -11,14 +13,29 @@ MetalDepthStencilCache::~MetalDepthStencilCache()
+         pair.second->release();
+     }
+     m_depthStencilCache.clear();
++    m_depthStencilMemo.clear();
+ }
+ 
+ MTL::DepthStencilState* MetalDepthStencilCache::GetDepthStencilState(const LatteContextRegister& lcr)
+ {
+     uint64 stateHash = CalculateDepthStencilHash(lcr);
++#ifdef BOTW_SPLIT_HOST
++    static const bool memoOn = botw_tune::enabled("draw_memo");
++    if (memoOn)
++    {
++        if (MTL::DepthStencilState* hit = m_depthStencilMemo.find(stateHash))
++            return hit;
++    }
++#endif
+     auto& depthStencilState = m_depthStencilCache[stateHash];
+     if (depthStencilState)
++    {
++#ifdef BOTW_SPLIT_HOST
++        if (memoOn)
++            m_depthStencilMemo.put(stateHash, depthStencilState);
++#endif
+         return depthStencilState;
++    }
+ 
+ 	// Depth stencil state
+ 	bool depthEnable = lcr.DB_DEPTH_CONTROL.get_Z_ENABLE();
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalDepthStencilCache.h b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalDepthStencilCache.h
+index 4ce05c2..fd1623e 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalDepthStencilCache.h
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalDepthStencilCache.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include "botw_draw_cache.h"
+ #include <Metal/Metal.hpp>
+ 
+ #include "HW/Latte/ISA/LatteReg.h"
+@@ -16,6 +17,7 @@ private:
+     class MetalRenderer* m_mtlr;
+ 
+     std::map<uint64, MTL::DepthStencilState*> m_depthStencilCache;
++    botw_draw::Memo<MTL::DepthStencilState*, 6> m_depthStencilMemo;   // draw_memo: render thread only
+ 
+     uint64 CalculateDepthStencilHash(const LatteContextRegister& lcr);
+ };
 diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalLayerHandle.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalLayerHandle.cpp
 index ddc9417..05d2759 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalLayerHandle.cpp
@@ -1283,11 +1404,68 @@ index ddc9417..05d2759 100644
      commandBuffer->presentDrawable(m_drawable);
      m_drawable = nullptr;
  }
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalMemoryManager.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalMemoryManager.cpp
+index d2fac40..1527bcb 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalMemoryManager.cpp
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalMemoryManager.cpp
+@@ -7,6 +7,7 @@
+ #include "Common/precompiled.h"
+ #include "HW/MMU/MMU.h"
+ #include "config/CemuConfig.h"
++#include "botw_perf.h"
+ 
+ MetalMemoryManager::~MetalMemoryManager()
+ {
+@@ -97,10 +98,20 @@ void MetalMemoryManager::UploadToBufferCache(const void* data, size_t offset, si
+     cemu_assert_debug(m_metalBufferCacheMode != MetalBufferCacheMode::Host);
+     cemu_assert_debug(m_bufferCache);
+     cemu_assert_debug((offset + size) <= m_bufferCache->length());
++#ifdef BOTW_SPLIT_HOST
++    botw_perf::g_uploads.fetch_add(1, std::memory_order_relaxed);
++    botw_perf::g_upload_bytes.fetch_add(size, std::memory_order_relaxed);
++    const uint64_t uploadBegin = botw_perf::g_gpu_diag.load(std::memory_order_relaxed) ? botw_perf::now_ns() : 0;
++    const uint64_t breaksBefore = botw_perf::g_pass_breaks_blit.load(std::memory_order_relaxed);
++#endif
+ 
+     if (m_metalBufferCacheMode == MetalBufferCacheMode::DevicePrivate)
+     {
+         auto blitCommandEncoder = m_mtlr->GetBlitCommandEncoder();
++#ifdef BOTW_SPLIT_HOST
++        if (botw_perf::g_pass_breaks_blit.load(std::memory_order_relaxed) != breaksBefore)
++            botw_perf::g_pass_breaks_upload.fetch_add(1, std::memory_order_relaxed);
++#endif
+ 
+         auto allocation = m_stagingAllocator.AllocateBufferMemory(size, 1);
+         memcpy(allocation.memPtr, data, size);
+@@ -114,10 +125,18 @@ void MetalMemoryManager::UploadToBufferCache(const void* data, size_t offset, si
+     {
+         memcpy((uint8*)m_bufferCache->contents() + offset, data, size);
+     }
++#ifdef BOTW_SPLIT_HOST
++    if (uploadBegin)
++        botw_perf::g_upload_cpu.add(botw_perf::now_ns() - uploadBegin);
++#endif
+ }
+ 
+ void MetalMemoryManager::CopyBufferCache(size_t srcOffset, size_t dstOffset, size_t size)
+ {
++#ifdef BOTW_SPLIT_HOST
++    botw_perf::g_cache_copies.fetch_add(1, std::memory_order_relaxed);
++    botw_perf::g_cache_copy_bytes.fetch_add(size, std::memory_order_relaxed);
++#endif
+     cemu_assert_debug(m_metalBufferCacheMode != MetalBufferCacheMode::Host);
+     cemu_assert_debug(m_bufferCache);
+ 
 diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.cpp
-index a922365..eb0a57e 100644
+index a922365..0dffe9b 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.cpp
 +++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.cpp
-@@ -16,6 +16,9 @@
+@@ -1,3 +1,4 @@
++#include "botw_tune.h"
+ #include "Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.h"
+ #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
+ #include "Cafe/HW/Latte/Renderer/Metal/LatteToMtl.h"
+@@ -16,6 +17,9 @@
  #include "config/ActiveSettings.h"
  
  #include <openssl/sha.h>
@@ -1297,7 +1475,7 @@ index a922365..eb0a57e 100644
  
  static bool g_compilePipelineThreadInit{false};
  static std::mutex g_compilePipelineMutex;
-@@ -25,6 +28,10 @@ static std::queue<MetalPipelineCompiler*> g_compilePipelineRequests;
+@@ -25,6 +29,10 @@ static std::queue<MetalPipelineCompiler*> g_compilePipelineRequests;
  static void compileThreadFunc(sint32 threadIndex)
  {
  	SetThreadName("compilePl");
@@ -1308,7 +1486,7 @@ index a922365..eb0a57e 100644
  
  	// one thread runs at normal priority while the others run at lower priority
  	if (threadIndex != 0)
-@@ -70,6 +77,9 @@ static void queuePipeline(MetalPipelineCompiler* v)
+@@ -70,6 +78,9 @@ static void queuePipeline(MetalPipelineCompiler* v)
  {
  	std::unique_lock lock(g_compilePipelineMutex);
  	g_compilePipelineRequests.push(std::move(v));
@@ -1318,6 +1496,50 @@ index a922365..eb0a57e 100644
  	lock.unlock();
  	g_compilePipelineCondVar.notify_one();
  }
+@@ -115,9 +126,23 @@ MetalPipelineCache::~MetalPipelineCache()
+ PipelineObject* MetalPipelineCache::GetRenderPipelineState(const LatteFetchShader* fetchShader, const LatteDecompilerShader* vertexShader, const LatteDecompilerShader* geometryShader, const LatteDecompilerShader* pixelShader, const MetalAttachmentsInfo& lastUsedAttachmentsInfo, const MetalAttachmentsInfo& activeAttachmentsInfo, Vector2i extend, uint32 indexCount, const LatteContextRegister& lcr)
+ {
+     uint64 hash = CalculatePipelineHash(fetchShader, vertexShader, geometryShader, pixelShader, lastUsedAttachmentsInfo, activeAttachmentsInfo, lcr);
++#ifdef BOTW_SPLIT_HOST
++    static const bool memoOn = botw_tune::enabled("draw_memo");
++    if (memoOn)
++    {
++        if (PipelineObject* hit = m_pipelineMemo.find(hash))
++            return hit;
++    }
++#endif
+     PipelineObject*& pipelineObj = m_pipelineCache[hash];
+     if (pipelineObj)
++    {
++#ifdef BOTW_SPLIT_HOST
++        if (memoOn)
++            m_pipelineMemo.put(hash, pipelineObj);
++#endif
+         return pipelineObj;
++    }
+ 
+     pipelineObj = new PipelineObject();
+ 
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.h b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.h
+index 270c2db..d2d2af8 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.h
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.h
+@@ -4,6 +4,7 @@
+ #include "util/helpers/ConcurrentQueue.h"
+ #include "util/helpers/fspinlock.h"
+ #include "util/math/vector2.h"
++#include "botw_draw_cache.h"
+ 
+ class MetalPipelineCache
+ {
+@@ -29,6 +30,7 @@ private:
+     class MetalRenderer* m_mtlr;
+ 
+     std::map<uint64, PipelineObject*> m_pipelineCache;
++    botw_draw::Memo<PipelineObject*> m_pipelineMemo;   // draw_memo: render thread only; a stale entry stays a live object
+     FSpinlock m_pipelineCacheLock;
+ 
+ 	std::thread* m_pipelineCacheStoreThread;
 diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp
 index 6193ab1..be576dc 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp
@@ -1351,18 +1573,20 @@ index 6193ab1..be576dc 100644
  
      auto creationDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
-index 51c61bc..ddb3540 100644
+index 51c61bc..dc65ee0 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
 +++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
-@@ -26,6 +26,7 @@
+@@ -26,6 +26,9 @@
  #define IMGUI_IMPL_METAL_CPP
  #include "imgui/imgui_extension.h"
  #include "imgui/imgui_impl_metal.h"
 +#include "botw_perf.h"
++#include "botw_tune.h"
++#include "botw_draw_cache.h"
  
  #define EVENT_VALUE_WRAP 4096
  
-@@ -379,6 +380,7 @@ void MetalRenderer::DrawEmptyFrame(bool mainWindow)
+@@ -379,6 +382,7 @@ void MetalRenderer::DrawEmptyFrame(bool mainWindow)
  
  void MetalRenderer::SwapBuffers(bool swapTV, bool swapDRC)
  {
@@ -1370,7 +1594,7 @@ index 51c61bc..ddb3540 100644
      if (swapTV)
          SwapBuffer(true);
      if (swapDRC)
-@@ -551,7 +553,10 @@ void MetalRenderer::Flush(bool waitIdle)
+@@ -551,7 +555,10 @@ void MetalRenderer::Flush(bool waitIdle)
          CommitCommandBuffer();
  
      if (waitIdle && m_executingCommandBuffers.size() != 0)
@@ -1381,7 +1605,7 @@ index 51c61bc..ddb3540 100644
  }
  
  void MetalRenderer::NotifyLatteCommandProcessorIdle()
-@@ -1228,7 +1233,12 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32
+@@ -1228,7 +1235,12 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32
      // Render pipeline state
      PipelineObject* pipelineObj = m_pipelineCache->GetRenderPipelineState(fetchShader, vertexShader, geometryShader, pixelShader, m_state.m_lastUsedFBO.m_attachmentsInfo, m_state.m_activeFBO.m_attachmentsInfo, m_state.m_activeFBO.m_fbo->m_size, count, LatteGPUState.contextNew);
      if (!pipelineObj->m_pipeline)
@@ -1394,7 +1618,17 @@ index 51c61bc..ddb3540 100644
  
      if (pipelineObj->m_pipeline != encoderState.m_renderPipelineState)
     	{
-@@ -1631,7 +1641,10 @@ void MetalRenderer::occlusionQuery_destroy(LatteQueryObject* queryObj) {
+@@ -1472,6 +1484,9 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32
+ 	}
+ 
+ 	m_state.m_isFirstDrawInRenderPass = false;
++#ifdef BOTW_SPLIT_HOST
++	m_passDraws++;
++#endif
+ 
+ 	// Occlusion queries
+ 	if (m_occlusionQuery.m_active)
+@@ -1631,7 +1646,10 @@ void MetalRenderer::occlusionQuery_destroy(LatteQueryObject* queryObj) {
  
  void MetalRenderer::occlusionQuery_flush() {
      if (m_occlusionQuery.m_lastCommandBuffer)
@@ -1405,7 +1639,116 @@ index 51c61bc..ddb3540 100644
  }
  
  void MetalRenderer::occlusionQuery_updateState() {
-@@ -1965,6 +1978,10 @@ void MetalRenderer::ProcessFinishedCommandBuffers()
+@@ -1756,6 +1774,9 @@ MTL::CommandBuffer* MetalRenderer::GetCommandBuffer()
+ 
+ 		m_recordedDrawcalls = 0;
+ 		m_commitTreshold = m_defaultCommitTreshlod;
++#ifdef BOTW_SPLIT_HOST
++		m_commandBufferGeneration++;
++#endif
+ 
+         // Debug
+         m_performanceMonitor.m_commandBuffers++;
+@@ -1768,11 +1789,41 @@ MTL::CommandBuffer* MetalRenderer::GetCommandBuffer()
+ 	}
+ }
+ 
++#ifdef BOTW_SPLIT_HOST
++// What opening a pass on this FBO moves: CachedFBOMtl loads and stores every attachment. Before compression, in bytes.
++static void BotwNotePassAttachments(CachedFBOMtl* fbo)
++{
++    uint64 attachments = 0, bytes = 0;
++    const auto add = [&](LatteTextureView* view, bool isDepth) {
++        sint32 width, height;
++        view->baseTexture->GetEffectiveSize(width, height, view->firstMip);
++        attachments++;
++        bytes += (uint64)width * height * GetMtlPixelFormatInfo(view->baseTexture->format, isDepth).bytesPerBlock;
++    };
++    for (uint8 i = 0; i < 8; i++)
++    {
++        if (fbo->colorBuffer[i].texture)
++            add(fbo->colorBuffer[i].texture, false);
++    }
++    if (fbo->depthBuffer.texture)
++        add(fbo->depthBuffer.texture, true);
++    botw_perf::g_attachments.fetch_add(attachments, std::memory_order_relaxed);
++    botw_perf::g_attach_bytes.fetch_add(bytes, std::memory_order_relaxed);
++}
++#endif
++
+ MTL::RenderCommandEncoder* MetalRenderer::GetTemporaryRenderCommandEncoder(MTL::RenderPassDescriptor* renderPassDescriptor)
+ {
++#ifdef BOTW_SPLIT_HOST
++    if (m_commandEncoder && m_encoderType == MetalEncoderType::Render)
++        botw_perf::g_pass_breaks_clear.fetch_add(1, std::memory_order_relaxed);
++#endif
+     EndEncoding();
+ 
+     auto commandBuffer = GetCommandBuffer();
++#ifdef BOTW_SPLIT_HOST
++    botw_perf::g_clear_passes.fetch_add(1, std::memory_order_relaxed);
++#endif
+ 
+     auto pool = NS::AutoreleasePool::alloc()->init();
+     auto renderCommandEncoder = commandBuffer->renderCommandEncoder(renderPassDescriptor)->retain();
+@@ -1838,6 +1889,12 @@ MTL::RenderCommandEncoder* MetalRenderer::GetRenderCommandEncoder(bool forceRecr
+     }
+ 
+     auto commandBuffer = GetCommandBuffer();
++#ifdef BOTW_SPLIT_HOST
++    botw_perf::g_render_passes.fetch_add(1, std::memory_order_relaxed);
++    BotwNotePassAttachments(m_state.m_activeFBO.m_fbo);
++    m_passDraws = 0;
++    m_passCounted = true;
++#endif
+ 
+     auto pool = NS::AutoreleasePool::alloc()->init();
+     auto renderCommandEncoder = commandBuffer->renderCommandEncoder(m_state.m_activeFBO.m_fbo->GetRenderPassDescriptor())->retain();
+@@ -1869,6 +1926,10 @@ MTL::ComputeCommandEncoder* MetalRenderer::GetComputeCommandEncoder()
+             return (MTL::ComputeCommandEncoder*)m_commandEncoder;
+         }
+ 
++#ifdef BOTW_SPLIT_HOST
++        if (m_encoderType == MetalEncoderType::Render)
++            botw_perf::g_pass_breaks_compute.fetch_add(1, std::memory_order_relaxed);
++#endif
+         EndEncoding();
+     }
+ 
+@@ -1894,10 +1955,17 @@ MTL::BlitCommandEncoder* MetalRenderer::GetBlitCommandEncoder()
+             return (MTL::BlitCommandEncoder*)m_commandEncoder;
+         }
+ 
++#ifdef BOTW_SPLIT_HOST
++        if (m_encoderType == MetalEncoderType::Render)
++            botw_perf::g_pass_breaks_blit.fetch_add(1, std::memory_order_relaxed);
++#endif
+         EndEncoding();
+     }
+ 
+     auto commandBuffer = GetCommandBuffer();
++#ifdef BOTW_SPLIT_HOST
++    botw_perf::g_blit_encoders.fetch_add(1, std::memory_order_relaxed);
++#endif
+ 
+     auto pool = NS::AutoreleasePool::alloc()->init();
+     auto blitCommandEncoder = commandBuffer->blitCommandEncoder()->retain();
+@@ -1914,6 +1982,14 @@ void MetalRenderer::EndEncoding()
+ {
+     if (m_commandEncoder)
+     {
++#ifdef BOTW_SPLIT_HOST
++        if (m_passCounted)
++        {
++            if (m_passDraws <= 4)
++                botw_perf::g_short_passes.fetch_add(1, std::memory_order_relaxed);
++            m_passCounted = false;
++        }
++#endif
+         m_commandEncoder->endEncoding();
+         m_commandEncoder->release();
+         m_commandEncoder = nullptr;
+@@ -1965,6 +2041,10 @@ void MetalRenderer::ProcessFinishedCommandBuffers()
          auto commandBuffer = *it;
          if (CommandBufferCompleted(commandBuffer))
          {
@@ -1416,7 +1759,7 @@ index 51c61bc..ddb3540 100644
              m_memoryManager->CleanupBuffers(commandBuffer);
              commandBuffer->release();
              it = m_executingCommandBuffers.erase(it);
-@@ -1989,6 +2006,7 @@ bool MetalRenderer::AcquireDrawable(bool mainWindow)
+@@ -1989,6 +2069,7 @@ bool MetalRenderer::AcquireDrawable(bool mainWindow)
          m_state.m_usesSRGB = latteBufferUsesSRGB;
      }
  
@@ -1424,6 +1767,112 @@ index 51c61bc..ddb3540 100644
      return layer.AcquireDrawable();
  }
  
+@@ -2235,12 +2316,30 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
+ 		}
+ 
+ 		size_t size = shader->uniform.uniformRangeSize;
++#ifdef BOTW_SPLIT_HOST
++		// support_dedupe: the block is often what this stage just uploaded. Shaders only read it, and the allocation stays valid within its command buffer.
++		static const bool dedupeOn = botw_tune::enabled("support_dedupe");
++		static botw_draw::SupportDedupe<MTL::Buffer*, sizeof(supportBufferData)> dedupe[METAL_SHADER_TYPE_TOTAL];
++		MTL::Buffer* reusedBuffer = nullptr;
++		size_t reusedOffset = 0;
++		if (dedupeOn && dedupe[mtlShaderType].find(supportBufferData, size, m_commandBufferGeneration, reusedBuffer, reusedOffset))
++		{
++			SetBuffer(renderCommandEncoder, mtlShaderType, reusedBuffer, reusedOffset, shader->resourceMapping.uniformVarsBufferBindingPoint);
++		}
++		else
++#endif
++		{
+ 		auto& bufferAllocator = m_memoryManager->GetStagingAllocator();
+ 		auto allocation = bufferAllocator.AllocateBufferMemory(size, 1);
+ 		memcpy(allocation.memPtr, supportBufferData, size);
+ 		bufferAllocator.FlushReservation(allocation);
+ 
+ 		SetBuffer(renderCommandEncoder, mtlShaderType, allocation.mtlBuffer, allocation.bufferOffset, shader->resourceMapping.uniformVarsBufferBindingPoint);
++#ifdef BOTW_SPLIT_HOST
++		if (dedupeOn)
++			dedupe[mtlShaderType].remember(supportBufferData, size, m_commandBufferGeneration, allocation.mtlBuffer, allocation.bufferOffset);
++#endif
++		}
+ 	}
+ 
+ 	// Uniform buffers
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h
+index b4d21af..ed5e9c1 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h
+@@ -339,6 +339,11 @@ public:
+     void SetSamplerState(MTL::RenderCommandEncoder* renderCommandEncoder, MetalShaderType shaderType, MTL::SamplerState* samplerState, uint32 index);
+ 
+ 	MTL::CommandBuffer* GetCommandBuffer();
++#ifdef BOTW_SPLIT_HOST
++    uint32 m_passDraws = 0;       // draws in the pass opened on an FBO
++    bool m_passCounted = false;   // such a pass is open
++    uint64 m_commandBufferGeneration = 0;   // support_dedupe: an allocation is only reused within its own command buffer
++#endif
+ 	MTL::RenderCommandEncoder* GetTemporaryRenderCommandEncoder(MTL::RenderPassDescriptor* renderPassDescriptor);
+ 	MTL::RenderCommandEncoder* GetRenderCommandEncoder(bool forceRecreate = false);
+     MTL::ComputeCommandEncoder* GetComputeCommandEncoder();
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalSamplerCache.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalSamplerCache.cpp
+index a34a971..dbff88c 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalSamplerCache.cpp
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalSamplerCache.cpp
+@@ -1,3 +1,5 @@
++#include "botw_perf.h"
++#include "botw_tune.h"
+ #include "Cafe/HW/Latte/Renderer/Metal/MetalSamplerCache.h"
+ #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
+ #include "Cafe/HW/Latte/Core/LatteShader.h"
+@@ -84,14 +86,29 @@ MetalSamplerCache::~MetalSamplerCache()
+         pair.second->release();
+     }
+     m_samplerCache.clear();
++    m_samplerMemo.clear();
+ }
+ 
+ MTL::SamplerState* MetalSamplerCache::GetSamplerState(const LatteContextRegister& lcr, LatteConst::ShaderType shaderType, uint32 stageSamplerIndex, const _LatteRegisterSetSampler* samplerWords)
+ {
+     uint64 stateHash = CalculateSamplerHash(lcr, shaderType, stageSamplerIndex, samplerWords);
++#ifdef BOTW_SPLIT_HOST
++    static const bool memoOn = botw_tune::enabled("draw_memo");
++    if (memoOn)
++    {
++        if (MTL::SamplerState* hit = m_samplerMemo.find(stateHash))
++            return hit;
++    }
++#endif
+     auto& samplerState = m_samplerCache[stateHash];
+     if (samplerState)
++    {
++#ifdef BOTW_SPLIT_HOST
++        if (memoOn)
++            m_samplerMemo.put(stateHash, samplerState);
++#endif
+         return samplerState;
++    }
+ 
+ 	// Sampler state
+ 
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalSamplerCache.h b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalSamplerCache.h
+index cbb02cf..0e6218a 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalSamplerCache.h
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalSamplerCache.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include "botw_draw_cache.h"
+ #include <Metal/Metal.hpp>
+ 
+ #include "HW/Latte/Core/LatteConst.h"
+@@ -17,6 +18,7 @@ private:
+     class MetalRenderer* m_mtlr;
+ 
+     std::map<uint64, MTL::SamplerState*> m_samplerCache;
++    botw_draw::Memo<MTL::SamplerState*> m_samplerMemo;   // draw_memo: render thread only
+ 
+     uint64 CalculateSamplerHash(const LatteContextRegister& lcr, LatteConst::ShaderType shaderType, uint32 stageSamplerIndex, const _LatteRegisterSetSampler* samplerWords);
+ };
 diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp
 index f00af85..efd4def 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp
@@ -1477,12 +1926,83 @@ index f00af85..efd4def 100644
      MTL::Library* library = nullptr;
  
      // First, try to retrieve the compiled shader from the AIR cache
+diff --git a/runtime/cemu_shims/botw_draw_cache.h b/runtime/cemu_shims/botw_draw_cache.h
+new file mode 100644
+index 0000000..419c01a
+--- /dev/null
++++ b/runtime/cemu_shims/botw_draw_cache.h
+@@ -0,0 +1,65 @@
++// Two small caches for the per-draw path of the Metal renderer, off by default (botw_tune.txt).
++// Both are used by the render thread only, and neither changes what a lookup returns.
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++namespace botw_draw {
++// draw_memo=1: a direct-mapped cache in front of a std::map searched several times per draw. A key's value must never
++// be replaced by a different live object while the memo is in use, or the memo must be cleared. A null value is a miss.
++template <typename Value, unsigned kBits = 8>
++class Memo {
++public:
++    Value find(uint64_t key) const {
++        const Entry& e = entries_[slot(key)];
++        return e.key == key ? e.value : Value{};
++    }
++    void put(uint64_t key, Value value) {
++        Entry& e = entries_[slot(key)];
++        e.key = key;
++        e.value = value;
++    }
++    void clear() {
++        for (Entry& e : entries_) e = Entry{};
++    }
++
++private:
++    struct Entry {
++        uint64_t key = 0;
++        Value value{};
++    };
++    static size_t slot(uint64_t key) { return (size_t)((key ^ (key >> kBits) ^ (key >> (2 * kBits))) & ((1u << kBits) - 1)); }
++    Entry entries_[1u << kBits];
++};
++
++// support_dedupe=1: the bytes last uploaded for one shader stage and where they are, so that an identical block binds
++// the same allocation again. An allocation stays valid only as long as its command buffer can still be recording, so
++// a different generation (one per command buffer) is always a miss.
++template <typename Buffer, size_t kMaxBytes>
++class SupportDedupe {
++public:
++    bool find(const void* data, size_t size, uint64_t generation, Buffer& buffer, size_t& offset) const {
++        if (!valid_ || generation != generation_ || size != size_ || memcmp(bytes_, data, size) != 0) return false;
++        buffer = buffer_;
++        offset = offset_;
++        return true;
++    }
++    void remember(const void* data, size_t size, uint64_t generation, Buffer buffer, size_t offset) {
++        valid_ = size <= kMaxBytes;
++        if (!valid_) return;
++        memcpy(bytes_, data, size);
++        size_ = size;
++        generation_ = generation;
++        buffer_ = buffer;
++        offset_ = offset;
++    }
++
++private:
++    bool valid_ = false;
++    size_t size_ = 0, offset_ = 0;
++    uint64_t generation_ = 0;
++    Buffer buffer_{};
++    unsigned char bytes_[kMaxBytes];
++};
++}  // namespace botw_draw
 diff --git a/runtime/cemu_shims/botw_perf.h b/runtime/cemu_shims/botw_perf.h
 new file mode 100644
-index 0000000..7cc927c
+index 0000000..9813bab
 --- /dev/null
 +++ b/runtime/cemu_shims/botw_perf.h
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,314 @@
 +// Light measurements for the split host (BOTW_SPLIT_HOST): relaxed atomics on the hot paths, and nothing that changes
 +// what the game does. A low-priority thread writes them out (ios/src/perf_ios.mm). Without BOTW_SPLIT_HOST every macro
 +// is empty. perf/perf_report.py reads what comes out; a column added here belongs there too.
@@ -1494,7 +2014,7 @@ index 0000000..7cc927c
 +#include <cstdio>
 +
 +namespace botw_perf {
-+constexpr const char* kVersion = "v7";
++constexpr const char* kVersion = "v8";
 +
 +inline uint64_t now_ns() {
 +    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1502,6 +2022,7 @@ index 0000000..7cc927c
 +
 +// frames: the frame and present times alone. enabled: everything. Comparing the two on one scene is the real cost.
 +inline std::atomic<bool> g_frames_on{false}, g_enabled{false};
++inline std::atomic<bool> g_gpu_diag{false};   // diag_gpu=1: the CPU time of each buffer upload, off by default
 +inline std::atomic<bool> g_locks_on{false};   // diag_locks=1: the global OS lock and guest mutexes, off by default so that v7 can be compared to v6.
 +inline std::atomic<bool> g_paused{false};   // In the background: frames stop, and the gap they leave is no stall.
 +
@@ -1536,6 +2057,14 @@ index 0000000..7cc927c
 +inline Counter g_klock_wait, g_klock_other, g_mutex_wait;   // diag_locks: the global OS lock, from guest mutexes and from everything else; guest mutexes held by another thread
 +inline std::atomic<uint64_t> g_mutex_ops{0}, g_yields{0}, g_waits{0};
 +inline std::atomic<uint64_t> g_gpu_busy_ns{0}, g_gpu_max_ns{0}, g_command_buffers{0}, g_draws_skipped{0}, g_pipe_queue_max{0};
++// What one frame asks of Metal, counted on the render thread. A pass broken by a blit or a compute encoder stores its attachments and loads them again.
++inline std::atomic<uint64_t> g_render_passes{0}, g_clear_passes{0}, g_pass_breaks_blit{0}, g_pass_breaks_compute{0}, g_blit_encoders{0}, g_uploads{0}, g_upload_bytes{0}, g_cache_copies{0}, g_cache_copy_bytes{0}, g_pages_hashed{0};
++// Why passes end, and what each one moves. A pass opened on an FBO loads and stores all its attachments (CachedFBOMtl): before compression, attach_bytes is what is read and again what is written.
++inline std::atomic<uint64_t> g_pass_breaks_upload{0}, g_pass_breaks_clear{0}, g_short_passes{0}, g_attachments{0}, g_attach_bytes{0};
++inline Counter g_upload_cpu;   // diag_gpu
++inline Counter g_gpu_semaphore, g_gpu_flip_wait;   // The two loops of the command processor that wait actively and had no measurement.
++// diag_locks: what guest threads ask of the scheduler, to compare with the context switches.
++inline std::atomic<uint64_t> g_sleeps{0}, g_wakes{0}, g_dc_flushes{0}, g_dc_pages{0}, g_dc_contended{0};
 +inline std::atomic<uint64_t> g_drawable_w{0}, g_drawable_h{0};
 +inline double g_gpu_last_end = 0;   // Render thread only: its command buffers finish in order.
 +
@@ -1736,6 +2265,10 @@ index 0000000..7cc927c
 +    BOTW_PERF_COUNTER_NAMES("fifo") BOTW_PERF_COUNTER_NAMES("swap_backlog") BOTW_PERF_COUNTER_NAMES("fs_read")
 +    BOTW_PERF_COUNTER_NAMES("fence") BOTW_PERF_COUNTER_NAMES("klock_wait") BOTW_PERF_COUNTER_NAMES("klock_other") BOTW_PERF_COUNTER_NAMES("mutex_wait")
 +    "mutex_ops,yields,waits,"
++    "render_passes,clear_passes,pass_breaks_blit,pass_breaks_compute,blit_encoders,uploads,upload_bytes,cache_copies,cache_copy_bytes,pages_hashed,"
++    "pass_breaks_upload,pass_breaks_clear,short_passes,attachments,attach_bytes,"
++    BOTW_PERF_COUNTER_NAMES("gpu_semaphore") BOTW_PERF_COUNTER_NAMES("gpu_flip_wait") BOTW_PERF_COUNTER_NAMES("upload_cpu")
++    "sleeps,wakes,dc_flushes,dc_pages,dc_contended,"
 +    "gpu_busy_ms,gpu_max_ms,cmdbufs,draws_skipped,pipe_queue_max,spikes_lost,"
 +    "audio_frames,audio_empty,audio_skips,audio_queue_min,audio_queue_max,audio_gap_max_ms,audio_work_max_ms,audio_starved_n,audio_starved_ms,"
 +    "draw_w,draw_h,paused";
@@ -1761,6 +2294,9 @@ index 0000000..7cc927c
 +                     (unsigned long long)games, percentile_ms(g, 0.5), percentile_ms(g, 0.99), take(g_game.max_ns) / 1e6);
 +    for (Counter* c : {&g_sync_pipeline, &g_async_pipeline, &g_sync_shader, &g_shader_compile, &g_wait_idle, &g_wait_occlusion, &g_wait_readback, &g_wait_drawable, &g_fifo_wait, &g_swap_backlog, &g_fs_read, &g_fence_wait, &g_klock_wait, &g_klock_other, &g_mutex_wait}) n += write_counter(out + n, room - n, *c);
 +    n += snprintf(out + n, room - n, ",%llu,%llu,%llu", (unsigned long long)take(g_mutex_ops), (unsigned long long)take(g_yields), (unsigned long long)take(g_waits));
++    for (std::atomic<uint64_t>* a : {&g_render_passes, &g_clear_passes, &g_pass_breaks_blit, &g_pass_breaks_compute, &g_blit_encoders, &g_uploads, &g_upload_bytes, &g_cache_copies, &g_cache_copy_bytes, &g_pages_hashed, &g_pass_breaks_upload, &g_pass_breaks_clear, &g_short_passes, &g_attachments, &g_attach_bytes}) n += snprintf(out + n, room - n, ",%llu", (unsigned long long)take(*a));
++    for (Counter* c : {&g_gpu_semaphore, &g_gpu_flip_wait, &g_upload_cpu}) n += write_counter(out + n, room - n, *c);
++    for (std::atomic<uint64_t>* a : {&g_sleeps, &g_wakes, &g_dc_flushes, &g_dc_pages, &g_dc_contended}) n += snprintf(out + n, room - n, ",%llu", (unsigned long long)take(*a));
 +    const uint64_t queue_min = g_audio_queue_min.exchange(UINT64_MAX, std::memory_order_relaxed);
 +    n += snprintf(out + n, room - n, ",%.1f,%.1f,%llu,%llu,%llu,%llu", take(g_gpu_busy_ns) / 1e6, take(g_gpu_max_ns) / 1e6, (unsigned long long)take(g_command_buffers), (unsigned long long)take(g_draws_skipped), (unsigned long long)take(g_pipe_queue_max),
 +                  (unsigned long long)take(g_spikes_lost));
@@ -1783,7 +2319,7 @@ index 0000000..7cc927c
 +#endif
 diff --git a/runtime/cemu_shims/botw_tune.h b/runtime/cemu_shims/botw_tune.h
 new file mode 100644
-index 0000000..b513d0d
+index 0000000..2d392ed
 --- /dev/null
 +++ b/runtime/cemu_shims/botw_tune.h
 @@ -0,0 +1,80 @@
@@ -1851,7 +2387,7 @@ index 0000000..b513d0d
 +}
 +
 +// Every key the host reads. Anything else in the file is reported in meta.txt: a typing mistake must not pass for a test.
-+constexpr const char* kKnownKeys[] = {"perf", "spike_ms", "diag_stall_ms", "diag_stall_stacks", "diag_locks", "ax_qos", "worker_qos", "fence_yield", "compile_qos", "audio_low_water_ms"};
++constexpr const char* kKnownKeys[] = {"perf", "spike_ms", "diag_stall_ms", "diag_stall_stacks", "diag_locks", "diag_gpu", "ax_qos", "worker_qos", "fence_yield", "compile_qos", "audio_low_water_ms", "wake_after_unlock", "draw_memo", "support_dedupe"};
 +
 +inline bool known(const std::string& key) {
 +    for (const char* k : kKnownKeys)
@@ -1960,10 +2496,10 @@ index 00c2baa..1dec612 100644
  }
  HLE_EXPORT(coreinit, FSWriteFile) {
 diff --git a/runtime/src/coreinit/sync.cpp b/runtime/src/coreinit/sync.cpp
-index 612bb41..6503f0f 100644
+index 612bb41..21c2f23 100644
 --- a/runtime/src/coreinit/sync.cpp
 +++ b/runtime/src/coreinit/sync.cpp
-@@ -3,14 +3,60 @@
+@@ -3,14 +3,74 @@
  // look; waiting uses per-object host condition variables under threads::g_klock.
  #include <chrono>
  #include <condition_variable>
@@ -1974,6 +2510,7 @@ index 612bb41..6503f0f 100644
 +#include <vector>
  
 +#include "../../cemu_shims/botw_perf.h"
++#include "../../cemu_shims/botw_tune.h"
  #include "hle.h"
  #include "thread.h"
  
@@ -1984,7 +2521,7 @@ index 612bb41..6503f0f 100644
 +// diag_locks=1: who waits for the global lock and for guest mutexes. Off, this is one relaxed load before the same lock.
 +struct ThreadLockStats {
 +    GuestThread* thread;
-+    std::atomic<uint64_t> klock_ns{0}, mutex_ns{0}, mutex_ops{0};
++    std::atomic<uint64_t> klock_ns{0}, mutex_ns{0}, mutex_ops{0}, yields{0}, sleeps{0}, waits{0};
 +};
 +static std::mutex g_lock_stats_lock;
 +static std::vector<ThreadLockStats*> g_lock_stats;
@@ -1997,6 +2534,19 @@ index 612bb41..6503f0f 100644
 +        g_lock_stats.push_back(t_lock_stats);
 +    }
 +    return *t_lock_stats;
++}
++
++void threads::note_yield() {
++    botw_perf::g_yields.fetch_add(1, std::memory_order_relaxed);
++    lock_stats().yields.fetch_add(1, std::memory_order_relaxed);
++}
++void threads::note_sleep() {
++    botw_perf::g_sleeps.fetch_add(1, std::memory_order_relaxed);
++    lock_stats().sleeps.fetch_add(1, std::memory_order_relaxed);
++}
++void threads::note_wait() {
++    botw_perf::g_waits.fetch_add(1, std::memory_order_relaxed);
++    lock_stats().waits.fetch_add(1, std::memory_order_relaxed);
 +}
 +
 +static inline void klock_measured(std::unique_lock<std::mutex>& l, botw_perf::Counter& counter) {
@@ -2024,7 +2574,37 @@ index 612bb41..6503f0f 100644
  namespace {
  std::unordered_map<uint32_t, std::condition_variable*> g_cvs;
  std::condition_variable& cv(uint32_t obj) {
-@@ -23,23 +69,48 @@ std::condition_variable& cv(uint32_t obj) {
+@@ -19,27 +79,78 @@ std::condition_variable& cv(uint32_t obj) {
+     return *p;
+ }
+ 
++// Waking a thread while holding g_klock makes it block on g_klock at once, which is one more context switch.
++// wake_after_unlock=1 releases the lock first. This is safe because (1) the caller has already changed the state
++// under g_klock, and a waiter tests that state under g_klock before it sleeps, so it either sees the change or is
++// already queued for this wake; (2) a condition variable is never destroyed, so the reference outlives the lock;
++// (3) the caller touches no guarded state after this call. A thread that takes a mutex ahead of the woken one
++// wakes the next waiter when it unlocks, as before.
++#ifdef BOTW_SPLIT_HOST
++bool wake_after_unlock() {
++    static const bool on = botw_tune::enabled("wake_after_unlock");
++    return on;
++}
++void wake_one(std::unique_lock<std::mutex>& l, std::condition_variable& waiters) {
++    if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) botw_perf::g_wakes.fetch_add(1, std::memory_order_relaxed);
++    if (wake_after_unlock()) l.unlock();
++    waiters.notify_one();
++}
++void wake_all(std::unique_lock<std::mutex>& l, std::condition_variable& waiters) {
++    if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) botw_perf::g_wakes.fetch_add(1, std::memory_order_relaxed);
++    if (wake_after_unlock()) l.unlock();
++    waiters.notify_all();
++}
++#else
++void wake_one(std::unique_lock<std::mutex>&, std::condition_variable& waiters) { waiters.notify_one(); }
++void wake_all(std::unique_lock<std::mutex>&, std::condition_variable& waiters) { waiters.notify_all(); }
++#endif
++
+ // ---- recursive mutexes (OSMutex and OSFastMutex share the implementation) ----------------
  struct MutexState {
      GuestThread* owner = nullptr;
      int count = 0;
@@ -2075,7 +2655,7 @@ index 612bb41..6503f0f 100644
      MutexState& s = g_mutexes[m];
      if (s.owner && s.owner != me) return false;
      s.owner = me;
-@@ -48,7 +119,7 @@ bool mutex_trylock(uint32_t m) {
+@@ -48,7 +159,7 @@ bool mutex_trylock(uint32_t m) {
  }
  void mutex_unlock(uint32_t m) {
      GuestThread* me = threads::current();
@@ -2084,7 +2664,12 @@ index 612bb41..6503f0f 100644
      MutexState& s = g_mutexes[m];
      if (s.owner != me) {
          LOG("mutex %08x unlocked by a non-owner (%s)", m, me ? me->name.c_str() : "?");
-@@ -60,11 +131,63 @@ void mutex_unlock(uint32_t m) {
+@@ -56,15 +167,84 @@ void mutex_unlock(uint32_t m) {
+     }
+     if (--s.count == 0) {
+         s.owner = nullptr;
+-        cv(m).notify_one();
++        wake_one(l, cv(m));
      }
  }
  void mutex_init(uint32_t m) {
@@ -2111,6 +2696,23 @@ index 612bb41..6503f0f 100644
 +            uint64_t klock, mutex, ops;
 +        };
 +        std::vector<Row> rows;
++        // "activity" rows, in the same columns: ops = yields, contended = sleeps, holder = waits. Who calls the scheduler, and how often.
++        struct Activity {
++            std::string name;
++            uint64_t yields, sleeps, waits;
++        };
++        std::vector<Activity> activity;
++        for (ThreadLockStats* s : all) {
++            Activity a{s->thread ? s->thread->name : "host", s->yields.exchange(0, std::memory_order_relaxed), s->sleeps.exchange(0, std::memory_order_relaxed), s->waits.exchange(0, std::memory_order_relaxed)};
++            if (a.yields || a.sleeps || a.waits) activity.push_back(std::move(a));
++        }
++        std::sort(activity.begin(), activity.end(), [](const Activity& a, const Activity& b) { return a.yields + a.sleeps + a.waits > b.yields + b.sleeps + b.waits; });
++        if (activity.size() > 16) activity.resize(16);
++        for (Activity& a : activity) {
++            std::replace(a.name.begin(), a.name.end(), ',', ';');
++            snprintf(line, sizeof line, "%.0f,activity,%s,0,0,%llu,%llu,%llu\n", t_s, a.name.c_str(), (unsigned long long)a.yields, (unsigned long long)a.sleeps, (unsigned long long)a.waits);
++            out += line;
++        }
 +        for (ThreadLockStats* s : all) {
 +            Row r{s->thread ? s->thread->name : "host", s->klock_ns.exchange(0, std::memory_order_relaxed), s->mutex_ns.exchange(0, std::memory_order_relaxed), s->mutex_ops.exchange(0, std::memory_order_relaxed)};
 +            std::replace(r.name.begin(), r.name.end(), ',', ';');
@@ -2149,15 +2751,17 @@ index 612bb41..6503f0f 100644
  HLE_EXPORT(coreinit, OSInitMutex) {
      uint32_t m = ARG(0);
      memset(mem::host(m), 0, 0x2C);
-@@ -108,19 +231,19 @@ HLE_EXPORT(coreinit, OSInitEvent) {
+@@ -108,19 +288,19 @@ HLE_EXPORT(coreinit, OSInitEvent) {
  }
  HLE_EXPORT(coreinit, OSSignalEvent) {
      uint32_t e = ARG(0);
 -    std::lock_guard<std::mutex> l(g_klock);
 +    KLOCK(l);
      mem::w32(e + 0x0C, 1);
-     if (mem::r32(e + 0x20) == 1) cv(e).notify_one();
-     else cv(e).notify_all();
+-    if (mem::r32(e + 0x20) == 1) cv(e).notify_one();
+-    else cv(e).notify_all();
++    if (mem::r32(e + 0x20) == 1) wake_one(l, cv(e));
++    else wake_all(l, cv(e));
  }
  HLE_EXPORT(coreinit, OSResetEvent) {
 -    std::lock_guard<std::mutex> l(g_klock);
@@ -2172,7 +2776,7 @@ index 612bb41..6503f0f 100644
      cv(e).wait(l, [&] { return mem::r32(e + 0x0C) != 0; });
      if (mem::r32(e + 0x20) == 1) mem::w32(e + 0x0C, 0);
  }
-@@ -129,7 +252,7 @@ HLE_EXPORT(coreinit, OSWaitEventWithTimeout) {
+@@ -129,7 +309,7 @@ HLE_EXPORT(coreinit, OSWaitEventWithTimeout) {
      uint32_t e = ARG(0);
      uint64_t ns = ARG64(2);
      threads::WaitMark w("event/timeout", e);
@@ -2181,7 +2785,7 @@ index 612bb41..6503f0f 100644
      bool ok = cv(e).wait_for(l, std::chrono::nanoseconds(ns), [&] { return mem::r32(e + 0x0C) != 0; });
      if (ok && mem::r32(e + 0x20) == 1) mem::w32(e + 0x0C, 0);
      RET(ok);
-@@ -145,7 +268,7 @@ HLE_EXPORT(coreinit, OSInitSemaphore) {
+@@ -145,7 +325,7 @@ HLE_EXPORT(coreinit, OSInitSemaphore) {
  HLE_EXPORT(coreinit, OSWaitSemaphore) {
      uint32_t s = ARG(0);
      threads::WaitMark w("semaphore", s);
@@ -2190,7 +2794,7 @@ index 612bb41..6503f0f 100644
      cv(s).wait(l, [&] { return (int32_t)mem::r32(s + 0x0C) > 0; });
      int32_t v = (int32_t)mem::r32(s + 0x0C);
      mem::w32(s + 0x0C, v - 1);
-@@ -153,14 +276,14 @@ HLE_EXPORT(coreinit, OSWaitSemaphore) {
+@@ -153,14 +333,14 @@ HLE_EXPORT(coreinit, OSWaitSemaphore) {
  }
  HLE_EXPORT(coreinit, OSSignalSemaphore) {
      uint32_t s = ARG(0);
@@ -2198,7 +2802,8 @@ index 612bb41..6503f0f 100644
 +    KLOCK(l);
      int32_t v = (int32_t)mem::r32(s + 0x0C);
      mem::w32(s + 0x0C, v + 1);
-     cv(s).notify_one();
+-    cv(s).notify_one();
++    wake_one(l, cv(s));
      RET(v);
  }
  HLE_EXPORT(coreinit, OSGetSemaphoreCount) {
@@ -2207,7 +2812,7 @@ index 612bb41..6503f0f 100644
      RET(mem::r32(ARG(0) + 0x0C));
  }
  
-@@ -173,7 +296,7 @@ HLE_EXPORT(coreinit, OSWaitRendezvous) {
+@@ -173,7 +353,7 @@ HLE_EXPORT(coreinit, OSWaitRendezvous) {
      uint32_t r = ARG(0), mask = ARG(1);
      int core = c->core;
      threads::WaitMark w("rendezvous", r);
@@ -2216,7 +2821,7 @@ index 612bb41..6503f0f 100644
      mem::w32(r + 4 * core, 1);
      cv(r).notify_all();
      cv(r).wait(l, [&] {
-@@ -199,7 +322,7 @@ HLE_EXPORT(coreinit, OSInitMessageQueue) {
+@@ -199,7 +379,7 @@ HLE_EXPORT(coreinit, OSInitMessageQueue) {
  // BOOL OSSendMessage(q, msg, flags): flags 1 = block, 2 = jam (front)
  HLE_EXPORT(coreinit, OSSendMessage) {
      uint32_t q = ARG(0), msg = ARG(1), flags = ARG(2);
@@ -2225,7 +2830,14 @@ index 612bb41..6503f0f 100644
      uint32_t cap = mem::r32(q + Q_CAP);
      if (mem::r32(q + Q_USED) >= cap) {
          if (!(flags & 1)) {
-@@ -226,7 +349,7 @@ HLE_EXPORT(coreinit, OSSendMessage) {
+@@ -220,13 +400,13 @@ HLE_EXPORT(coreinit, OSSendMessage) {
+     }
+     memcpy(mem::host(mem::r32(q + Q_MSGS) + slot * 16), mem::host(msg), 16);
+     mem::w32(q + Q_USED, used + 1);
+-    cv(q).notify_all();
++    wake_all(l, cv(q));
+     RET(1);
+ }
  // BOOL OSReceiveMessage(q, msg, flags): flags 1 = block
  HLE_EXPORT(coreinit, OSReceiveMessage) {
      uint32_t q = ARG(0), msg = ARG(1), flags = ARG(2);
@@ -2234,7 +2846,13 @@ index 612bb41..6503f0f 100644
      if (mem::r32(q + Q_USED) == 0) {
          if (!(flags & 1)) {
              RET(0);
-@@ -244,7 +367,7 @@ HLE_EXPORT(coreinit, OSReceiveMessage) {
+@@ -239,12 +419,12 @@ HLE_EXPORT(coreinit, OSReceiveMessage) {
+     memcpy(mem::host(msg), mem::host(mem::r32(q + Q_MSGS) + first * 16), 16);
+     mem::w32(q + Q_FIRST, (first + 1) % cap);
+     mem::w32(q + Q_USED, mem::r32(q + Q_USED) - 1);
+-    cv(q).notify_all();
++    wake_all(l, cv(q));
+     RET(1);
  }
  HLE_EXPORT(coreinit, OSPeekMessage) {
      uint32_t q = ARG(0), msg = ARG(1);
@@ -2445,7 +3063,7 @@ index ebb7299..3e216a9 100644
  			return -1;
  		if (queued > kHighWaterFrames)
 diff --git a/runtime/src/thread.cpp b/runtime/src/thread.cpp
-index 03899a6..eed7e1e 100644
+index 03899a6..39591bf 100644
 --- a/runtime/src/thread.cpp
 +++ b/runtime/src/thread.cpp
 @@ -8,9 +8,16 @@
@@ -2531,14 +3149,14 @@ index 03899a6..eed7e1e 100644
      std::lock_guard<std::mutex> l(g_klock);
      t->os = new_os_thread(name, 0, stack + stack_size, stack_size, 0, core);
      init_context(&t->ctx, stack + stack_size, core);
-@@ -358,13 +408,21 @@ HLE_EXPORT(coreinit, OSSetThreadSpecific) {
+@@ -358,18 +408,29 @@ HLE_EXPORT(coreinit, OSSetThreadSpecific) {
  
  HLE_EXPORT(coreinit, OSGetCoreId) { RET(current() ? current()->core : 1); }
  HLE_EXPORT(coreinit, OSGetStackPointer) { RET(c->r[1]); }
 -HLE_EXPORT(coreinit, OSYieldThread) { sched_yield(); }
 +HLE_EXPORT(coreinit, OSYieldThread) {
 +#ifdef BOTW_SPLIT_HOST
-+    if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) botw_perf::g_yields.fetch_add(1, std::memory_order_relaxed);
++    if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) threads::note_yield();
 +#endif
 +    sched_yield();
 +}
@@ -2549,13 +3167,21 @@ index 03899a6..eed7e1e 100644
      int64_t ticks = (int64_t)ARG64(0);
      if (ticks <= 0) {
 +#ifdef BOTW_SPLIT_HOST
-+        if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) botw_perf::g_yields.fetch_add(1, std::memory_order_relaxed);
++        if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) threads::note_yield();
 +#endif
          sched_yield();
          return;
      }
+     uint64_t ns = (uint64_t)((__int128)ticks * 1000000000 / 62156250);
+     struct timespec ts = {(time_t)(ns / 1000000000), (long)(ns % 1000000000)};
++#ifdef BOTW_SPLIT_HOST
++    if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) threads::note_sleep();
++#endif
+     threads::WaitMark w("sleep", (uint32_t)(ns / 1000));
+     nanosleep(&ts, nullptr);
+ }
 diff --git a/runtime/src/thread.h b/runtime/src/thread.h
-index 8666075..b898566 100644
+index 8666075..993ea8e 100644
 --- a/runtime/src/thread.h
 +++ b/runtime/src/thread.h
 @@ -1,5 +1,6 @@
@@ -2565,7 +3191,7 @@ index 8666075..b898566 100644
  #include <pthread.h>
  
  #include <atomic>
-@@ -60,6 +61,10 @@ void sample_host(pthread_t th, const char* label);
+@@ -60,6 +61,17 @@ void sample_host(pthread_t th, const char* label);
  void note_main_wait(const char* kind, uint64_t ns);
  std::string main_wait_report();
  
@@ -2573,15 +3199,22 @@ index 8666075..b898566 100644
 +std::string stall_snapshot(bool stacks);   // stalls.csv: never stalls the game longer than a guest mutex operation does
 +#endif
 +
++#ifdef BOTW_SPLIT_HOST
++// diag_locks, per guest thread, for locks.csv (coreinit/sync.cpp).
++void note_yield();
++void note_sleep();
++void note_wait();
++#endif
++
  // Marks the current guest thread as blocked for the scope of a wait (shown by dump(); the main
  // thread's waits are also timed for main_wait_report()).
  struct WaitMark {
-@@ -67,6 +72,9 @@ struct WaitMark {
+@@ -67,6 +79,9 @@ struct WaitMark {
      const char* kind;
      std::chrono::steady_clock::time_point t0;
      WaitMark(const char* k, uint32_t obj) : t(current()), kind(k) {
 +#ifdef BOTW_SPLIT_HOST
-+        if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) botw_perf::g_waits.fetch_add(1, std::memory_order_relaxed);
++        if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) note_wait();
 +#endif
          if (!t) return;
          t->wait_obj = obj;
