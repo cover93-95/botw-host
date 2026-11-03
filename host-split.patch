@@ -13,13 +13,13 @@ index 0000000..99f4716
 +</dict>
 +</plist>
 diff --git a/ios/CMakeLists.txt b/ios/CMakeLists.txt
-index b0c511d..b3df890 100644
+index b0c511d..761a8ba 100644
 --- a/ios/CMakeLists.txt
 +++ b/ios/CMakeLists.txt
 @@ -39,6 +39,11 @@ find_package(zstd REQUIRED CONFIG PATHS ${DEPS}/lib/cmake/zstd NO_DEFAULT_PATH)
  # A14 == M1 ISA (armv8.5-a), so the guest code is compiled for the same features as on macOS.
  set(BOTW_CPU -mcpu=apple-a14)
- 
+
 +# BOTW_SPLIT_HOST: build the app without generated/. The guest code is a Guest.framework built elsewhere
 +# from the player's own game files and added to the app before signing (ios/src/guest_ios.mm).
 +option(BOTW_SPLIT_HOST "Build the host alone, with no recompiled guest code" OFF)
@@ -33,20 +33,10 @@ index b0c511d..b3df890 100644
  set_source_files_properties(${BIG_SOURCES} PROPERTIES COMPILE_OPTIONS "-O1")
  set_source_files_properties(${HUGE_SOURCES} PROPERTIES COMPILE_OPTIONS "-O0")
 +endif()
- 
+
  # ---- vendored Cemu Latte GPU + shims ---------------------------------------------------------
  file(GLOB_RECURSE CEMU_SOURCES CONFIGURE_DEPENDS
-@@ -75,6 +81,9 @@ target_include_directories(cemu_gpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat
-   ${ROOT}/runtime/cemu/dependencies/metal-cpp ${ROOT}/runtime/cemu/dependencies/imgui
-   /opt/homebrew/opt/boost/include /opt/homebrew/opt/glm/include)
- target_link_libraries(cemu_gpu PRIVATE fmt::fmt zstd::libzstd_static)
-+if(BOTW_SPLIT_HOST)
-+  target_compile_definitions(cemu_gpu PRIVATE BOTW_SPLIT_HOST)
-+endif()
- target_compile_definitions(cemu_gpu PRIVATE BOOST_NOWIDE_NO_LIB ENABLE_METAL BOTWRECOMP IMGUI_IMPL_METAL_CPP
-   EMULATOR_VERSION_MAJOR=2 EMULATOR_VERSION_MINOR=6 EMULATOR_VERSION_PATCH=0 EMULATOR_HASH=a53cf0e)
- target_compile_options(cemu_gpu PRIVATE -w -O2 -g1
-@@ -86,8 +95,15 @@ file(GLOB IOS_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.mm ${C
+@@ -86,8 +92,15 @@ file(GLOB IOS_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.mm ${C
  # main.cpp's main() becomes botw_main(); ios/src/main_ios.mm owns main() (UIApplicationMain via SDL)
  set_source_files_properties(${ROOT}/runtime/src/main.cpp PROPERTIES COMPILE_DEFINITIONS "main=botw_main")
  # CEMU_SOURCES with the AppKit view excluded need a CreateMetalLayer: ios/src/MetalLayer_ios.mm
@@ -64,119 +54,12 @@ index b0c511d..b3df890 100644
  target_include_directories(BotWRecomp PRIVATE ${ROOT}/runtime/include ${ROOT}/runtime/src ${ROOT}/generated
  )
  target_compile_options(BotWRecomp PRIVATE -Wall -Wno-unused-function -Wno-unused-variable -fwrapv ${BOTW_CPU}
-diff --git a/ios/src/bootlog.h b/ios/src/bootlog.h
-new file mode 100644
-index 0000000..04e84e7
---- /dev/null
-+++ b/ios/src/bootlog.h
-@@ -0,0 +1,101 @@
-+// What a first start leaves behind, however it ends (BOTW_SPLIT_HOST). A crash, a kill by iOS and a freeze all stop this
-+// file at the last step reached, in a folder the Files app can read. Plain C++, so that it can be tested away from a phone.
-+#pragma once
-+#include <stdio.h>
-+#include <string.h>
-+#ifdef __APPLE__
-+#include <unistd.h>
-+#endif
-+
-+#include <string>
-+
-+namespace bootlog {
-+struct Previous {
-+    bool found = false;       // There was an earlier start.
-+    bool finished = false;    // It reached the game's first frame, or ended cleanly.
-+    std::string last_step;
-+    int failures = 0;         // Earlier starts in a row that never reached a frame.
-+};
-+
-+inline void sync_file(FILE* f) {
-+    fflush(f);
-+#ifdef __APPLE__
-+    fsync(fileno(f));   // iOS kills without warning: what is not on disk did not happen.
-+#endif
-+}
-+
-+class Log {
-+   public:
-+    // Keeps the previous journal, and reads how it ended.
-+    void begin(const std::string& folder) {
-+        const std::string path = folder + "/botw_boot.txt", old = folder + "/botw_boot_prev.txt";
-+        counter_ = folder + "/botw_boot_failures.txt";
-+        if (FILE* f = fopen(path.c_str(), "r")) {
-+            previous_.found = true;
-+            char line[512];
-+            while (fgets(line, sizeof line, f)) {
-+                line[strcspn(line, "\r\n")] = 0;
-+                if (!strncmp(line, "STEP ", 5)) previous_.last_step = line + 5;
-+                if (!strcmp(line, "STEP first_frame") || !strcmp(line, "END clean")) previous_.finished = true;
-+            }
-+            fclose(f);
-+            remove(old.c_str());
-+            rename(path.c_str(), old.c_str());
-+        }
-+        if (FILE* f = fopen(counter_.c_str(), "r")) {
-+            if (fscanf(f, "%d", &previous_.failures) != 1) previous_.failures = 0;
-+            fclose(f);
-+        }
-+        if (previous_.found && !previous_.finished) previous_.failures++;
-+        if (previous_.finished) previous_.failures = 0;
-+        write_counter(previous_.failures);
-+        file_ = fopen(path.c_str(), "w");
-+    }
-+    const Previous& previous() const { return previous_; }
-+
-+    void line(const char* text) {
-+        if (!file_) return;
-+        fprintf(file_, "%s\n", text);
-+        sync_file(file_);
-+    }
-+    void step(const char* name, const std::string& memory = "") {
-+        if (!file_) return;
-+        fprintf(file_, "STEP %s\n", name);
-+        if (!memory.empty()) fprintf(file_, "  %s\n", memory.c_str());
-+        sync_file(file_);
-+        if (!strcmp(name, "first_frame")) write_counter(0);
-+    }
-+
-+   private:
-+    void write_counter(int value) {
-+        if (FILE* f = fopen(counter_.c_str(), "w")) {
-+            fprintf(f, "%d\n", value);
-+            fclose(f);
-+        }
-+    }
-+    FILE* file_ = nullptr;
-+    Previous previous_;
-+    std::string counter_;
-+};
-+
-+// After this many starts in a row with no frame, the next one asks less of the phone.
-+constexpr int kFailuresBeforeSafeMode = 2;
-+inline bool wants_safe_mode(const Previous& previous, bool user_asked) { return user_asked || previous.failures >= kFailuresBeforeSafeMode; }
-+
-+// A copy of a file, for one the Files app cannot reach. False when there was nothing to copy.
-+inline bool copy_file(const std::string& from, const std::string& to) {
-+    FILE* in = fopen(from.c_str(), "rb");
-+    if (!in) return false;
-+    FILE* out = fopen(to.c_str(), "wb");
-+    if (!out) {
-+        fclose(in);
-+        return false;
-+    }
-+    char buffer[65536];
-+    size_t n;
-+    while ((n = fread(buffer, 1, sizeof buffer, in)) > 0) fwrite(buffer, 1, n, out);
-+    fclose(in);
-+    fclose(out);
-+    return true;
-+}
-+}  // namespace bootlog
 diff --git a/ios/src/diag_ios.mm b/ios/src/diag_ios.mm
 new file mode 100644
-index 0000000..51fc8a9
+index 0000000..7320c7b
 --- /dev/null
 +++ b/ios/src/diag_ios.mm
-@@ -0,0 +1,409 @@
+@@ -0,0 +1,338 @@
 +// What the phone really allows, measured before any game code runs (BOTW_SPLIT_HOST). See split_ios.h.
 +//
 +// Three numbers are kept apart on purpose. Virtual: address space taken, which reserving raises and which costs no
@@ -202,7 +85,6 @@ index 0000000..51fc8a9
 +#include <string>
 +#include <vector>
 +
-+#include "bootlog.h"
 +#include "entitlement_scan.h"
 +#include "split_ios.h"
 +
@@ -249,7 +131,7 @@ index 0000000..51fc8a9
 +class Report {
 +   public:
 +    explicit Report(const char* docs) {
-+        std::string path = std::string(docs) + "/botw_diag_v3.txt";
++        std::string path = std::string(docs) + "/botw_diag_v2.txt";
 +        fd_ = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
 +    }
 +    ~Report() {
@@ -279,7 +161,7 @@ index 0000000..51fc8a9
 +    std::string finish() {
 +        const char* verdict = failed_ ? "FAIL" : warned_ ? "WARN" : "PASS";
 +        line("RESULT DIAG %s", verdict);
-+        return summary_ + "\nDIAG " + verdict + "\nDetails: botw_diag_v3.txt in the app's files.";
++        return summary_ + "\nDIAG " + verdict + "\nDetails: botw_diag_v2.txt in the app's files.";
 +    }
 +
 +   private:
@@ -383,78 +265,9 @@ index 0000000..51fc8a9
 +
 +std::string botw_mem_line() { return mem_text(read_mem()); }
 +
-+namespace {
-+bootlog::Log g_boot;
-+bool g_safe_mode = false, g_had_log = false;
-+std::string g_docs, g_runtime_log;
-+}  // namespace
-+
-+std::string botw_boot_begin(const char* docs, const char* support) {
-+    g_boot.begin(docs);
-+    const bootlog::Previous& previous = g_boot.previous();
-+    // Library is out of the Files app's reach, and the runtime's log is reopened empty on every start.
-+    g_docs = docs;
-+    g_runtime_log = std::string(support) + "/BotWRecomp/runtime.log";
-+    const bool had_log = g_had_log = bootlog::copy_file(g_runtime_log, g_docs + "/runtime_prev.log");
-+    bool asked = false;
-+    if (FILE* f = fopen((std::string(docs) + "/safe_mode").c_str(), "r")) {
-+        asked = true;
-+        fclose(f);
-+    }
-+    g_safe_mode = bootlog::wants_safe_mode(previous, asked);
-+
-+    char s[512];
-+    snprintf(s, sizeof s, "previous start: %s, last step %s, starts in a row with no frame %d, its log kept: %s, safe mode now: %s",
-+             previous.found ? (previous.finished ? "reached a frame" : "ENDED EARLY") : "none", previous.last_step.empty() ? "-" : previous.last_step.c_str(),
-+             previous.failures, yes_no(had_log), yes_no(g_safe_mode));
-+    g_boot.line(s);
-+    g_boot.step("launch", botw_mem_line());
-+    return previous.found && !previous.finished ? s : "";
-+}
-+
-+extern "C" void botw_boot_step(const char* name) { g_boot.step(name, botw_mem_line()); }
-+bool botw_boot_safe_mode() { return g_safe_mode; }
-+void botw_boot_end() { g_boot.line("END clean"); }
-+
-+namespace {
-+// The journal, on the real file system. The runtime is not running here, so a marker stands for its log: the next start
-+// has to find it and copy it where the Files app can read it.
-+void report_boot(Report& r) {
-+    bool wrote = false;
-+    if (FILE* f = fopen((g_docs + "/botw_boot.txt").c_str(), "r")) {
-+        char line[256];
-+        while (fgets(line, sizeof line, f)) wrote = wrote || !strncmp(line, "STEP guest_load", 15);
-+        fclose(f);
-+    }
-+    r.result("BOOT_JOURNAL", wrote ? "PASS" : "FAIL", wrote ? "botw_boot.txt holds this start's steps" : "this start's steps are not in botw_boot.txt");
-+
-+    const bootlog::Previous& p = g_boot.previous();
-+    char s[320];
-+    snprintf(s, sizeof s, "%s, last step %s, starts in a row with no frame %d", !p.found ? "first start" : p.finished ? "the last start ended cleanly" : "the last start ENDED EARLY",
-+             p.last_step.empty() ? "-" : p.last_step.c_str(), p.failures);
-+    r.result("BOOT_PREVIOUS", "PASS", s);
-+    snprintf(s, sizeof s, "%s, it takes %d starts in a row with no frame", g_safe_mode ? "ON" : "off", bootlog::kFailuresBeforeSafeMode);
-+    r.result("BOOT_SAFE_MODE", "PASS", s);
-+
-+    bool marker = false;
-+    if (g_had_log) {
-+        if (FILE* f = fopen((g_docs + "/runtime_prev.log").c_str(), "r")) {
-+            char line[64] = {};
-+            marker = fgets(line, sizeof line, f) && !strncmp(line, "diagnostic marker", 17);
-+            fclose(f);
-+        }
-+    }
-+    r.result("BOOT_LOG", !p.found || marker ? "PASS" : "FAIL", !p.found ? "first start: nothing to copy yet" : marker ? "the last start's log was copied to runtime_prev.log" : "the last start's log was not copied");
-+    if (FILE* f = fopen(g_runtime_log.c_str(), "w")) {
-+        fprintf(f, "diagnostic marker\n");
-+        fclose(f);
-+    }
-+}
-+}  // namespace
-+
 +std::string botw_diag_run(const char* docs, GuestLoad guest) {
 +    Report r(docs);
-+    r.line("BotW host diagnostic v3. No game code ran.");
++    r.line("BotW host diagnostic v2. No game code ran.");
 +    const Mem launch = read_mem();
 +
 +    char model[64] = {};
@@ -467,7 +280,6 @@ index 0000000..51fc8a9
 +           (unsigned long long)(memsize / kMiB));
 +    r.line("MEM launch: %s", mem_text(launch).c_str());
 +    report_authorization(r, launch, model);
-+    report_boot(r);
 +
 +    // ---- Guest.framework ------------------------------------------------------------------------
 +    uint64_t base = 0, size = 0;
@@ -749,26 +561,25 @@ index 0000000..817c4d6
 +}
 +#endif
 diff --git a/ios/src/main_ios.mm b/ios/src/main_ios.mm
-index dee5dcb..42f7165 100644
+index dee5dcb..82e098d 100644
 --- a/ios/src/main_ios.mm
 +++ b/ios/src/main_ios.mm
 @@ -15,6 +15,9 @@
  #include <vector>
- 
+
  #include "log.h"
 +#ifdef BOTW_SPLIT_HOST
 +#include "split_ios.h"
 +#endif
- 
+
  int botw_main(int argc, char** argv);
- 
-@@ -58,8 +61,13 @@ void start_stats_thread(std::string device) {
+
+@@ -58,8 +61,12 @@ void start_stats_thread(std::string device) {
              std::this_thread::sleep_for(std::chrono::seconds(first ? 2 : 10));
              if (first) LOG("%s", device.c_str());  // the log file is open by now
              first = false;
 +#ifdef BOTW_SPLIT_HOST
 +            LOG("ios: %s", botw_mem_line().c_str());
-+            botw_boot_step("alive");   // The last one tells how long the app lasted, and with how much memory.
 +#else
              LOG("ios: footprint %llu MB, available before jetsam %llu MB",
                  (unsigned long long)(footprint_bytes() >> 20), (unsigned long long)(os_proc_available_memory() >> 20));
@@ -776,124 +587,34 @@ index dee5dcb..42f7165 100644
          }
      }).detach();
  }
-@@ -79,6 +87,34 @@ int ios_main(int argc, char** argv) {
+@@ -79,6 +86,21 @@ int ios_main(int argc, char** argv) {
      [kReadme writeToFile:[docs stringByAppendingPathComponent:@"README.txt"] atomically:YES
                  encoding:NSUTF8StringEncoding error:nil];
- 
+
 +#ifdef BOTW_SPLIT_HOST
-+    const std::string after_failure = botw_boot_begin(docs.UTF8String, support.UTF8String);
-+    botw_boot_step("guest_load");
 +    // Before mem::init: the framework has to take its place below the shared cache, because the 4 GB guest space
 +    // only fits above it. With no game code in the app there is only the diagnostic to run.
 +    const GuestLoad guest = botw_guest_load();
 +    if (guest != GuestLoad::Game) {
 +        const std::string summary = botw_diag_run(docs.UTF8String, guest);
-+        const SDL_MessageBoxButtonData done[] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "OK"}, {0, 1, "Test a crash"}};
++        const SDL_MessageBoxButtonData done[] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "OK"}};
 +        const SDL_MessageBoxData box = {SDL_MESSAGEBOX_INFORMATION, nullptr, "BotW host diagnostic", summary.c_str(),
-+                                        2, done, nullptr};
++                                        1, done, nullptr};
 +        int pressed = 0;
 +        SDL_ShowMessageBox(&box, &pressed);
-+        if (pressed == 1) {   // A real crash, for the next start to report: only the phone can show the journal survives one.
-+            botw_boot_step("crash_test");
-+            abort();
-+        }
-+        botw_boot_end();
 +        return 0;
-+    }
-+    if (!after_failure.empty()) {
-+        const SDL_MessageBoxButtonData go_on[] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "Continue"}};
-+        const SDL_MessageBoxData notice = {SDL_MESSAGEBOX_WARNING, nullptr, "The last start ended early", after_failure.c_str(), 1, go_on, nullptr};
-+        int pressed = 0;
-+        SDL_ShowMessageBox(&notice, &pressed);
 +    }
 +#endif
 +
      std::vector<std::string> args(argv, argv + argc);
      bool has_game_arg = false;
      for (auto& a : args) has_game_arg |= a == "--game";
-@@ -118,6 +154,14 @@ int ios_main(int argc, char** argv) {
-              (unsigned long long)(os_proc_available_memory() >> 20));
-     start_stats_thread(device);
- 
-+#ifdef BOTW_SPLIT_HOST
-+    if (botw_boot_safe_mode()) {   // The original frame rate and resolution: runtime/src/main.cpp's own switches.
-+        for (const char* a : {"--fps", "30", "--scale", "1"}) args.push_back(a);
-+    }
-+#endif
-+#ifdef BOTW_SPLIT_HOST
-+    botw_perf_start(docs.UTF8String);
-+#endif
-     std::vector<char*> cargv;
-     for (auto& a : args) cargv.push_back(a.data());
-     cargv.push_back(nullptr);
-diff --git a/ios/src/perf_ios.mm b/ios/src/perf_ios.mm
-new file mode 100644
-index 0000000..b88022b
---- /dev/null
-+++ b/ios/src/perf_ios.mm
-@@ -0,0 +1,56 @@
-+// Writes the measurements of cemu_shims/botw_perf.h to <Documents>/botw_perf.csv every 5 s, from a low-priority thread.
-+// On by default in this build; a file <Documents>/botw_perf_off turns it off. The previous run's file is kept.
-+#ifdef BOTW_SPLIT_HOST
-+#import <Foundation/Foundation.h>
-+#include <mach/mach.h>
-+#include <os/proc.h>
-+#include <pthread.h>
-+#include <unistd.h>
-+
-+#include <cstdio>
-+#include <string>
-+#include <thread>
-+
-+#include "../../runtime/cemu_shims/botw_perf.h"
-+#include "split_ios.h"
-+
-+namespace {
-+constexpr int kWindowSeconds = 5;
-+
-+void write_loop(FILE* out) {
-+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
-+    pthread_setname_np("botw_perf");
-+    fprintf(out, "%s,footprint_mb,available_mb,thermal\n", botw_perf::kHeader);
-+    fflush(out);
-+    const uint64_t begin = botw_perf::now_ns();
-+    uint64_t last = begin;
-+    for (;;) {
-+        sleep(kWindowSeconds);
-+        const uint64_t now = botw_perf::now_ns();
-+        char line[1024];
-+        const int n = botw_perf::write_window(line, sizeof line, (now - begin) / 1e9, (now - last) / 1e9);
-+        last = now;
-+        task_vm_info_data_t vm = {};
-+        mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-+        const bool ok = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS;
-+        fprintf(out, "%.*s,%llu,%llu,%d\n", n, line, ok ? (unsigned long long)(vm.phys_footprint >> 20) : 0, (unsigned long long)(os_proc_available_memory() >> 20),
-+                (int)NSProcessInfo.processInfo.thermalState);
-+        fflush(out);
-+    }
-+}
-+}  // namespace
-+
-+void botw_perf_start(const char* docs) {
-+    const std::string folder = docs;
-+    if (FILE* off = fopen((folder + "/botw_perf_off").c_str(), "r")) {
-+        fclose(off);
-+        return;
-+    }
-+    const std::string path = folder + "/botw_perf.csv";
-+    rename(path.c_str(), (folder + "/botw_perf_prev.csv").c_str());
-+    FILE* out = fopen(path.c_str(), "w");
-+    if (!out) return;
-+    botw_perf::g_enabled.store(true, std::memory_order_relaxed);
-+    std::thread(write_loop, out).detach();
-+}
-+#endif
 diff --git a/ios/src/split_ios.h b/ios/src/split_ios.h
 new file mode 100644
-index 0000000..0ee44b8
+index 0000000..9175609
 --- /dev/null
 +++ b/ios/src/split_ios.h
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,23 @@
 +// The host built without generated/ (BOTW_SPLIT_HOST): loading Guest.framework, and the diagnostic.
 +#pragma once
 +#include <cstdint>
@@ -913,291 +634,62 @@ index 0000000..0ee44b8
 +// Where the framework's code landed, and its size in memory. 0 when none is loaded.
 +void botw_guest_image(uint64_t& base, uint64_t& size);
 +
-+// The first start's journal (bootlog.h). botw_boot_step is safe to call before botw_boot_begin.
-+// Returns the arguments the runtime should add: a repeated failure asks less of the phone.
-+std::string botw_boot_begin(const char* docs, const char* support);
-+extern "C" void botw_boot_step(const char* name);
-+bool botw_boot_safe_mode();
-+void botw_boot_end();
-+
-+// Frame, compilation, GPU wait and audio measurements, written to <docs>/botw_perf.csv (perf_ios.mm).
-+void botw_perf_start(const char* docs);
-+
 +// One line that keeps apart what is only reserved (virtual) from what iOS counts against the app (footprint).
 +std::string botw_mem_line();
 +// Writes <docs>/botw_diag.txt line by line, so a kill leaves the last step reached. Returns a short summary.
 +std::string botw_diag_run(const char* docs, GuestLoad guest);
-diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.cpp
-index 53ac354..dba46ce 100644
---- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.cpp
-+++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.cpp
-@@ -1,6 +1,7 @@
- #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
- #include "Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.h"
- #include "Cafe/HW/Latte/Renderer/Metal/LatteTextureMtl.h"
-+#include "botw_perf.h"
- 
- LatteTextureReadbackInfoMtl::~LatteTextureReadbackInfoMtl()
- {
-@@ -41,6 +42,7 @@ bool LatteTextureReadbackInfoMtl::IsFinished()
- 
- void LatteTextureReadbackInfoMtl::ForceFinish()
- {
-+    BOTW_PERF_SCOPE(g_wait_readback);
-     m_commandBuffer->waitUntilCompleted();
- }
- 
-diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp
-index 6193ab1..fc7c989 100644
---- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp
-+++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp
-@@ -1,4 +1,5 @@
- #include "Cafe/HW/Latte/Renderer/Metal/MetalCommon.h"
-+#include "botw_perf.h"
- #include "Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.h"
- #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
- #include "Cafe/HW/Latte/Renderer/Metal/CachedFBOMtl.h"
-@@ -314,6 +315,9 @@ void MetalPipelineCompiler::InitFromState(const LatteFetchShader* fetchShader, c
- 
- bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool showInOverlay)
- {
-+#ifdef BOTW_SPLIT_HOST
-+    botw_perf::Scoped botw_perf_compile(isRenderThread ? botw_perf::g_sync_pipeline : botw_perf::g_async_pipeline);
-+#endif
-     if (m_usesGeometryShader && !m_mtlr->SupportsMeshShaders())
-         return false;
- 
-diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
-index 51c61bc..6524dd3 100644
---- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
-+++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
-@@ -26,6 +26,7 @@
- #define IMGUI_IMPL_METAL_CPP
- #include "imgui/imgui_extension.h"
- #include "imgui/imgui_impl_metal.h"
-+#include "botw_perf.h"
- 
- #define EVENT_VALUE_WRAP 4096
- 
-@@ -379,6 +380,7 @@ void MetalRenderer::DrawEmptyFrame(bool mainWindow)
- 
- void MetalRenderer::SwapBuffers(bool swapTV, bool swapDRC)
- {
-+    BOTW_PERF_FRAME();
-     if (swapTV)
-         SwapBuffer(true);
-     if (swapDRC)
-@@ -551,7 +553,10 @@ void MetalRenderer::Flush(bool waitIdle)
-         CommitCommandBuffer();
- 
-     if (waitIdle && m_executingCommandBuffers.size() != 0)
-+    {
-+        BOTW_PERF_SCOPE(g_wait_idle);
-         m_executingCommandBuffers.back()->waitUntilCompleted();
-+    }
- }
- 
- void MetalRenderer::NotifyLatteCommandProcessorIdle()
-@@ -1631,7 +1636,10 @@ void MetalRenderer::occlusionQuery_destroy(LatteQueryObject* queryObj) {
- 
- void MetalRenderer::occlusionQuery_flush() {
-     if (m_occlusionQuery.m_lastCommandBuffer)
-+    {
-+        BOTW_PERF_SCOPE(g_wait_occlusion);
-         m_occlusionQuery.m_lastCommandBuffer->waitUntilCompleted();
-+    }
- }
- 
- void MetalRenderer::occlusionQuery_updateState() {
-@@ -1965,6 +1973,13 @@ void MetalRenderer::ProcessFinishedCommandBuffers()
-         auto commandBuffer = *it;
-         if (CommandBufferCompleted(commandBuffer))
-         {
-+#ifdef BOTW_SPLIT_HOST
-+            if (botw_perf::g_enabled.load(std::memory_order_relaxed))
-+            {
-+                botw_perf::g_gpu_ns.fetch_add((uint64_t)((commandBuffer->GPUEndTime() - commandBuffer->GPUStartTime()) * 1e9), std::memory_order_relaxed);
-+                botw_perf::g_command_buffers.fetch_add(1, std::memory_order_relaxed);
-+            }
-+#endif
-             m_memoryManager->CleanupBuffers(commandBuffer);
-             commandBuffer->release();
-             it = m_executingCommandBuffers.erase(it);
-@@ -1989,6 +2004,7 @@ bool MetalRenderer::AcquireDrawable(bool mainWindow)
-         m_state.m_usesSRGB = latteBufferUsesSRGB;
-     }
- 
-+    BOTW_PERF_SCOPE(g_wait_drawable);
-     return layer.AcquireDrawable();
- }
- 
-diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp
-index f00af85..9aa7f43 100644
---- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp
-+++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp
-@@ -8,6 +8,7 @@
- #include "Common/precompiled.h"
- #include "GameProfile/GameProfile.h"
- #include "util/helpers/helpers.h"
-+#include "botw_perf.h"
- 
- #define METAL_AIR_CACHE_NAME "Cemu_AIR_cache"
- #define METAL_AIR_CACHE_PATH "/Volumes/" METAL_AIR_CACHE_NAME
-@@ -233,6 +234,9 @@ RendererShaderMtl::~RendererShaderMtl()
- 
- void RendererShaderMtl::PreponeCompilation(bool isRenderThread)
- {
-+#ifdef BOTW_SPLIT_HOST
-+    botw_perf::Scoped botw_perf_shader(isRenderThread ? botw_perf::g_sync_shader : botw_perf::g_async_pipeline);
-+#endif
- 	shaderMtlThreadPool.s_compilationQueueMutex.lock();
- 	bool isStillQueued = m_compilationState.hasState(COMPILATION_STATE::QUEUED);
- 	if (isStillQueued)
-diff --git a/runtime/cemu_shims/botw_perf.h b/runtime/cemu_shims/botw_perf.h
-new file mode 100644
-index 0000000..cbd72f7
---- /dev/null
-+++ b/runtime/cemu_shims/botw_perf.h
-@@ -0,0 +1,139 @@
-+// Light measurements for the split host (BOTW_SPLIT_HOST): only relaxed atomics on the hot paths, and nothing that
-+// changes what the game does. A low-priority thread writes them out (ios/src/perf_ios.mm). Without BOTW_SPLIT_HOST
-+// every macro is empty.
-+#pragma once
-+#ifdef BOTW_SPLIT_HOST
-+#include <atomic>
-+#include <chrono>
-+#include <cstdint>
-+#include <cstdio>
-+
-+namespace botw_perf {
-+inline uint64_t now_ns() {
-+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-+}
-+
-+inline std::atomic<bool> g_enabled{false};
-+
-+inline void raise_max(std::atomic<uint64_t>& slot, uint64_t value) {
-+    uint64_t seen = slot.load(std::memory_order_relaxed);
-+    while (value > seen && !slot.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
-+    }
-+}
-+
-+struct Counter {
-+    std::atomic<uint64_t> count{0}, total_ns{0}, max_ns{0};
-+    void add(uint64_t ns) {
-+        count.fetch_add(1, std::memory_order_relaxed);
-+        total_ns.fetch_add(ns, std::memory_order_relaxed);
-+        raise_max(max_ns, ns);
-+    }
+diff --git a/runtime/cemu_shims/config/CemuConfig.h b/runtime/cemu_shims/config/CemuConfig.h
+index 5fd61c6..19b7377 100644
+--- a/runtime/cemu_shims/config/CemuConfig.h
++++ b/runtime/cemu_shims/config/CemuConfig.h
+@@ -15,7 +15,14 @@ enum class AccurateShaderMulOption { False = 0, True = 1 };
+ enum class MetalBufferCacheMode { Auto, DevicePrivate, DeviceShared, Host };
+ enum class PositionInvariance { Auto, False, True };
+ enum class ScreenPosition { kDisabled = 0, kTopLeft, kTopCenter, kTopRight, kBottomLeft, kBottomCenter, kBottomRight };
+-enum FullscreenScaling { kKeepAspectRatio = 0, kStretch, kFillCrop };  // kFillCrop: BotWRecomp (cover, crop overflow)
++enum FullscreenScaling {
++    kKeepAspectRatio = 0,
++    kStretch,
++    kFillCrop,
++    // Full drawable presentation for an image whose projection already matches the physical panel.
++    // Unlike the user-facing Stretch mode, this compensates the non-matching 1536x1080 backing size.
++    kNativeAspect,
 +};
-+
-+inline Counter g_sync_pipeline, g_async_pipeline, g_sync_shader;   // Compilation
-+inline Counter g_wait_idle, g_wait_occlusion, g_wait_readback, g_wait_drawable;   // The CPU waiting for the GPU
-+inline std::atomic<uint64_t> g_gpu_ns{0}, g_command_buffers{0};
-+
-+// Frames, by upper bound in milliseconds. The last bucket takes everything above.
-+constexpr int kBounds[] = {12, 17, 20, 25, 33, 50, 75, 100, 150, 250};
-+constexpr int kBuckets = sizeof kBounds / sizeof kBounds[0] + 1;
-+inline std::atomic<uint64_t> g_frame_buckets[kBuckets];
-+inline std::atomic<uint64_t> g_frame_max_ns{0}, g_last_frame_ns{0};
-+
-+inline void add_frame(uint64_t ns) {
-+    const uint64_t ms = ns / 1000000;
-+    int i = 0;
-+    while (i < kBuckets - 1 && ms >= (uint64_t)kBounds[i]) i++;
-+    g_frame_buckets[i].fetch_add(1, std::memory_order_relaxed);
-+    raise_max(g_frame_max_ns, ns);
-+}
-+
-+inline void frame_presented() {
-+    if (!g_enabled.load(std::memory_order_relaxed)) return;
-+    const uint64_t now = now_ns();
-+    const uint64_t last = g_last_frame_ns.exchange(now, std::memory_order_relaxed);
-+    if (last) add_frame(now - last);
-+}
-+
-+// Audio. "Empty" is the output queue found at zero by the AX thread, every 3 ms: it can miss a very short gap.
-+inline std::atomic<uint64_t> g_audio_frames{0}, g_audio_empty{0}, g_audio_skips{0}, g_audio_gap_max_ns{0}, g_audio_work_max_ns{0};
-+inline std::atomic<uint64_t> g_audio_queue_min{UINT64_MAX};
-+inline std::atomic<bool> g_audio_was_empty{false};
-+
-+inline void audio_queue(uint64_t queued) {
-+    if (!g_enabled.load(std::memory_order_relaxed)) return;
-+    uint64_t seen = g_audio_queue_min.load(std::memory_order_relaxed);
-+    while (queued < seen && !g_audio_queue_min.compare_exchange_weak(seen, queued, std::memory_order_relaxed)) {
-+    }
-+    const bool empty = queued == 0;
-+    if (empty && !g_audio_was_empty.exchange(true, std::memory_order_relaxed)) g_audio_empty.fetch_add(1, std::memory_order_relaxed);
-+    if (!empty) g_audio_was_empty.store(false, std::memory_order_relaxed);
-+}
-+
-+class Scoped {
-+   public:
-+    explicit Scoped(Counter& counter) : counter_(g_enabled.load(std::memory_order_relaxed) ? &counter : nullptr), begin_(counter_ ? now_ns() : 0) {}
-+    ~Scoped() {
-+        if (counter_) counter_->add(now_ns() - begin_);
-+    }
-+    Scoped(const Scoped&) = delete;
-+    Scoped& operator=(const Scoped&) = delete;
-+
-+   private:
-+    Counter* counter_;
-+    uint64_t begin_;
-+};
-+
-+// The upper bound of the bucket holding this share of frames, 0 with no frame. It is a bound, not an exact time.
-+inline int percentile_ms(const uint64_t* buckets, double share) {
-+    uint64_t total = 0, seen = 0;
-+    for (int i = 0; i < kBuckets; i++) total += buckets[i];
-+    if (!total) return 0;
-+    const uint64_t target = (uint64_t)(total * share + 0.999999);
-+    for (int i = 0; i < kBuckets - 1; i++) {
-+        seen += buckets[i];
-+        if (seen >= target) return kBounds[i];
-+    }
-+    return 999;
-+}
-+
-+inline uint64_t take(std::atomic<uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); }
-+
-+inline int write_counter(char* out, size_t room, Counter& c) {
-+    const uint64_t n = take(c.count), total = take(c.total_ns), most = take(c.max_ns);
-+    return snprintf(out, room, ",%llu,%.1f,%.1f", (unsigned long long)n, total / 1e6, most / 1e6);
-+}
-+
-+constexpr const char* kHeader =
-+    "t_s,frames,fps,p50_ms,p95_ms,p99_ms,max_ms,over33,over50,over100,"
-+    "sync_pipe_n,sync_pipe_ms,sync_pipe_max,async_pipe_n,async_pipe_ms,async_pipe_max,sync_shader_n,sync_shader_ms,sync_shader_max,"
-+    "idle_n,idle_ms,idle_max,occl_n,occl_ms,occl_max,readback_n,readback_ms,readback_max,drawable_n,drawable_ms,drawable_max,"
-+    "gpu_ms,cmdbufs,audio_frames,audio_empty,audio_skips,audio_queue_min,audio_gap_max_ms,audio_work_max_ms";
-+
-+// One window of measurements as a CSV line, resetting the counters. Returns its length.
-+inline int write_window(char* out, size_t room, double t_s, double window_s) {
-+    uint64_t buckets[kBuckets], frames = 0;
-+    for (int i = 0; i < kBuckets; i++) frames += (buckets[i] = take(g_frame_buckets[i]));
-+    uint64_t over33 = 0, over50 = 0, over100 = 0;
-+    for (int i = 0; i < kBuckets; i++) {
-+        const int low = i ? kBounds[i - 1] : 0;
-+        if (low >= 33) over33 += buckets[i];
-+        if (low >= 50) over50 += buckets[i];
-+        if (low >= 100) over100 += buckets[i];
-+    }
-+    int n = snprintf(out, room, "%.0f,%llu,%.1f,%d,%d,%d,%.1f,%llu,%llu,%llu", t_s, (unsigned long long)frames, frames / window_s, percentile_ms(buckets, 0.5), percentile_ms(buckets, 0.95),
-+                     percentile_ms(buckets, 0.99), take(g_frame_max_ns) / 1e6, (unsigned long long)over33, (unsigned long long)over50, (unsigned long long)over100);
-+    for (Counter* c : {&g_sync_pipeline, &g_async_pipeline, &g_sync_shader, &g_wait_idle, &g_wait_occlusion, &g_wait_readback, &g_wait_drawable}) n += write_counter(out + n, room - n, *c);
-+    const uint64_t queue_min = g_audio_queue_min.exchange(UINT64_MAX, std::memory_order_relaxed);
-+    n += snprintf(out + n, room - n, ",%.1f,%llu,%llu,%llu,%llu,%lld,%.1f,%.1f", take(g_gpu_ns) / 1e6, (unsigned long long)take(g_command_buffers), (unsigned long long)take(g_audio_frames),
-+                  (unsigned long long)take(g_audio_empty), (unsigned long long)take(g_audio_skips), queue_min == UINT64_MAX ? -1LL : (long long)queue_min, take(g_audio_gap_max_ns) / 1e6, take(g_audio_work_max_ns) / 1e6);
-+    return n;
-+}
-+}  // namespace botw_perf
-+
-+#define BOTW_PERF_SCOPE(counter) botw_perf::Scoped botw_perf_scope_##counter(botw_perf::counter)
-+#define BOTW_PERF_FRAME() botw_perf::frame_presented()
-+#else
-+#define BOTW_PERF_SCOPE(counter)
-+#define BOTW_PERF_FRAME()
-+#endif
+ enum UpscalingFilter { kLinearFilter = 0, kBicubicFilter, kBicubicHermiteFilter, kNearestNeighborFilter };
+ enum class GraphicAPI { kOpenGL = 0, kVulkan, kMetal };
+
+diff --git a/runtime/cemu_shims/graphic_pack_shim.cpp b/runtime/cemu_shims/graphic_pack_shim.cpp
+index 8c43bec..4a74abf 100644
+--- a/runtime/cemu_shims/graphic_pack_shim.cpp
++++ b/runtime/cemu_shims/graphic_pack_shim.cpp
+@@ -5,6 +5,7 @@
+ #include "Cafe/GraphicPack/GraphicPack2.h"
+
+ extern float g_render_scale;  // runtime: --scale
++extern float g_render_scale_x, g_render_scale_y;  // Native Duo uses independent 1536x1080 axes
+
+ namespace {
+ struct Row {
+@@ -25,7 +26,7 @@ const Row kRows[] = {
+ const std::vector<std::shared_ptr<GraphicPack2>>& GraphicPack2::GetActiveGraphicPacks() {
+     static std::vector<std::shared_ptr<GraphicPack2>> packs = [] {
+         std::vector<std::shared_ptr<GraphicPack2>> v;
+-        if (g_render_scale == 1.0f) return v;
++        if (g_render_scale_x == 1.0f && g_render_scale_y == 1.0f) return v;
+         auto gp = std::make_shared<GraphicPack2>();
+         gp->m_name = "BotWRecomp resolution";
+         for (const Row& r : kRows) {
+@@ -39,8 +40,8 @@ const std::vector<std::shared_ptr<GraphicPack2>>& GraphicPack2::GetActiveGraphic
+             f.tilemode_whitelist = r.tilemodes;
+             f.tilemode_blacklist = r.tilemodes_excluded;
+             auto& o = rule.overwrite_settings;
+-            o.width = (int)(g_render_scale * r.ow + r.ow_add);  // the pack's expressions truncate
+-            o.height = (int)(g_render_scale * r.oh + r.oh_add);
++            o.width = (int)(g_render_scale_x * r.ow + r.ow_add);  // the pack's expressions truncate
++            o.height = (int)(g_render_scale_y * r.oh + r.oh_add);
+             o.format = r.overwrite_format;
+             gp->m_rules.push_back(rule);
+         }
 diff --git a/runtime/include/guest_table.h b/runtime/include/guest_table.h
 index 782c4c3..1f1adc3 100644
 --- a/runtime/include/guest_table.h
@@ -1205,7 +697,7 @@ index 782c4c3..1f1adc3 100644
 @@ -14,7 +14,19 @@ struct GuestImportEntry {
      GuestFn fn;  // HLE implementation (function imports)
  };
- 
+
 +#ifdef BOTW_SPLIT_HOST
 +// The host is built without generated/: these come from Guest.framework at launch (ios/src/guest_ios.mm).
 +extern const GuestFnEntry* g_split_functions;
@@ -1222,143 +714,343 @@ index 782c4c3..1f1adc3 100644
  extern const GuestImportEntry g_guest_imports[];
  extern const uint32_t g_guest_import_count;
 +#endif
-diff --git a/runtime/src/host/window.mm b/runtime/src/host/window.mm
-index 18da3aa..65bd4c7 100644
---- a/runtime/src/host/window.mm
-+++ b/runtime/src/host/window.mm
-@@ -25,6 +25,10 @@ extern std::atomic<pthread_t> g_gpu_thread;  // cemu_shims/overlay_menu.cpp: Cem
- 
- extern "C" int g_trace_hle;
- 
-+#ifdef BOTW_SPLIT_HOST
-+extern "C" void botw_boot_step(const char* name);
-+#endif
+diff --git a/runtime/src/game/hooks.h b/runtime/src/game/hooks.h
+index 25660c0..648aeaf 100644
+--- a/runtime/src/game/hooks.h
++++ b/runtime/src/game/hooks.h
+@@ -7,6 +7,11 @@
+ #include "../os.h"
+
+ #define BOTW_HOOK(addr) extern "C" void hook_##addr(PPCContext* c)
++// Same hook mechanism, but tools/recompile.py refuses to generate guest code unless the input is
++// the exact USA v208 RPX and the original instruction at addr matches opcode.
++#define BOTW_HOOK_EXPECT(addr, opcode) extern "C" void hook_##addr(PPCContext* c)
++// Records an additional opcode prerequisite without emitting a hook at that address.
++#define BOTW_EXPECT_OPCODE(addr, opcode)
+
+ // The calling thread's next GX2WaitForVsync returns immediately.
+ extern thread_local bool g_skip_vsync_wait;
+diff --git a/runtime/src/game/native_duo.cpp b/runtime/src/game/native_duo.cpp
+new file mode 100644
+index 0000000..8eda9dd
+--- /dev/null
++++ b/runtime/src/game/native_duo.cpp
+@@ -0,0 +1,116 @@
++#include "native_duo.h"
 +
- namespace window {
- namespace {
- SDL_Window* g_win = nullptr;
-@@ -363,6 +367,15 @@ void run() {
-             }
-         }
-         apply_input();
-+#ifdef BOTW_SPLIT_HOST
-+        {
-+            static bool first_frame_seen = false;
-+            if (!first_frame_seen && g_game_frames) {
-+                first_frame_seen = true;
-+                botw_boot_step("first_frame");
-+            }
++#include <CommonCrypto/CommonDigest.h>
++
++#include <array>
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <iterator>
++
++#include "hooks.h"
++#include "../log.h"
++#include "../mem.h"
++
++namespace native_duo {
++namespace {
++std::atomic<bool> g_active{false};
++constexpr char kV208Sha256[] = "ba58da5b95ce929e005d058ceb08b9b2788d1ab2bbc8a6c189bbadca0bb34d30";
++
++struct Word {
++    uint32_t addr;
++    uint32_t expected;
++};
++
++constexpr Word kCodeWords[] = {
++    {0x02e2c564, 0xec0b0028},  // fsubs f0,f11,f0
++    {0x02e2c578, 0xec806024},  // fdivs f4,f0,f12
++    {0x0386d01c, 0xed8d0028},  // fsubs f12,f13,f0
++    {0x0386d020, 0xed8b6024},  // fdivs f12,f11,f12
++    {0x035b0a30, 0x3ca0102f},  // lis r5, relocated grass-culling constant
++    {0x035b0a38, 0xc16594d8},  // lfs f11,-27432(r5)
++};
++
++constexpr Word kAspectWords[] = {
++    {0x101bf8e8, 0x3fe374bc},  // 1.777f in the original v208 image
++    {0x1030a57c, 0x3fe38e39},  // 16:9
++    {0x1036dd4c, 0x3fe38e39},  // 16:9
++};
++
++bool sha256(const std::string& path, char out[65]) {
++    FILE* f = fopen(path.c_str(), "rb");
++    if (!f) return false;
++    CC_SHA256_CTX ctx;
++    CC_SHA256_Init(&ctx);
++    std::array<unsigned char, 1024 * 1024> buf{};
++    while (size_t n = fread(buf.data(), 1, buf.size(), f)) CC_SHA256_Update(&ctx, buf.data(), (CC_LONG)n);
++    bool ok = !ferror(f);
++    fclose(f);
++    if (!ok) return false;
++    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
++    CC_SHA256_Final(digest, &ctx);
++    for (size_t i = 0; i < sizeof digest; i++) snprintf(out + i * 2, 3, "%02x", digest[i]);
++    out[64] = 0;
++    return true;
++}
++
++bool validate_words(const Word* words, size_t count, const char* kind) {
++    for (size_t i = 0; i < count; i++) {
++        uint32_t got = mem::r32(words[i].addr);
++        if (got != words[i].expected) {
++            LOG("Native Duo: %s mismatch at %08x: expected %08x, got %08x; falling back to Fit",
++                kind, words[i].addr, words[i].expected, got);
++            return false;
 +        }
-+#endif
-         // Freeze watchdog: no game frame for 8 s while in the foreground -> log every thread (once a minute)
-         {
-             static uint64_t seen = 0, changed_ms = 0, dumped_ms = 0;
++    }
++    return true;
++}
++}  // namespace
++
++bool configure(bool requested, const std::string& rpx_path) {
++    g_active = false;
++    if (!requested) {
++        LOG("Native Duo: disabled; using the original 16:9 path");
++        return true;
++    }
++    char digest[65];
++    if (!sha256(rpx_path, digest)) {
++        LOG("Native Duo: cannot hash %s; falling back to Fit", rpx_path.c_str());
++        return false;
++    }
++    if (strcmp(digest, kV208Sha256)) {
++        LOG("Native Duo: RPX SHA-256 mismatch: expected %s, got %s; falling back to Fit", kV208Sha256, digest);
++        return false;
++    }
++    if (!validate_words(kCodeWords, std::size(kCodeWords), "opcode") ||
++        !validate_words(kAspectWords, std::size(kAspectWords), "constant"))
++        return false;
++
++    // These are the three v208 aspect constants changed by Cemu's graphics pack. This only changes
++    // the already-loaded guest-memory image and never writes to U-King.rpx.
++    for (const Word& word : kAspectWords) mem::wf32(word.addr, kAspect);
++    g_active = true;
++    LOG("Native Duo: enabled for verified USA v208, aspect 317:223 (%.6f), render target %dx%d",
++        kAspect, kRenderWidth, kRenderHeight);
++    return true;
++}
++
++bool active() { return g_active.load(std::memory_order_relaxed); }
++
++// The original instructions calculate a 16:9 value. Hooks run immediately afterwards and replace
++// only the resulting FPR, which is equivalent to the small Cemu codecaves without modifying code.
++BOTW_EXPECT_OPCODE(0x02e2c564, 0xec0b0028)
++BOTW_HOOK_EXPECT(0x02e2c578, 0xec806024) {
++    if (active()) c->f[4] = kAspect;
++}
++
++BOTW_EXPECT_OPCODE(0x0386d01c, 0xed8d0028)
++BOTW_HOOK_EXPECT(0x0386d020, 0xed8b6024) {
++    if (active()) c->f[12] = kAspect;
++}
++
++BOTW_EXPECT_OPCODE(0x035b0a30, 0x3ca0102f)
++BOTW_HOOK_EXPECT(0x035b0a38, 0xc16594d8) {
++    if (active()) c->f[11] = kGameAspect / kAspect;
++}
++}  // namespace native_duo
+diff --git a/runtime/src/game/native_duo.h b/runtime/src/game/native_duo.h
+new file mode 100644
+index 0000000..2a3326e
+--- /dev/null
++++ b/runtime/src/game/native_duo.h
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include <string>
++
++namespace native_duo {
++constexpr float kAspect = 317.0f / 223.0f;
++constexpr float kGameAspect = 16.0f / 9.0f;
++constexpr int kRenderWidth = 1536;
++constexpr int kRenderHeight = 1080;
++
++// Verifies the exact USA v208 RPX, validates every patched word and only then changes the loaded
++// in-memory constants. The RPX on disk is never modified. False requests an immediate Fit fallback.
++bool configure(bool requested, const std::string& rpx_path);
++bool active();
++}  // namespace native_duo
+diff --git a/runtime/src/host/menu.cpp b/runtime/src/host/menu.cpp
+index 2077b39..053b66d 100644
+--- a/runtime/src/host/menu.cpp
++++ b/runtime/src/host/menu.cpp
+@@ -7,6 +7,7 @@
+ #include <mutex>
+
+ #include "../settings.h"
++#include "../game/native_duo.h"
+
+ extern float g_render_scale;  // main.cpp: the scale this run renders at
+
+@@ -16,7 +17,7 @@ std::mutex g_lock;
+ std::atomic<bool> g_open{false};
+ int g_cursor = 0;
+
+-enum RowId { kFps, kScale, kDisplay, kFilter, kGyro, kRumble, kLayout, kTouch, kShowFps, kVolume, kClose, kRows };
++enum RowId { kFps, kScale, kDisplay, kNativeDuo, kFilter, kGyro, kRumble, kLayout, kTouch, kShowFps, kVolume, kClose, kRows };
+ const float kScales[] = {0, 0.5f, 0.75f, 1, 1.5f, 2, 2.5f, 3};  // 0 = fit the display
+ const char* kDisplays[] = {"Fit 16:9", "Stretch", "Fill (crop)"};
+ const char* kFilters[] = {"Bilinear", "Bicubic", "Hermite", "Nearest"};
+@@ -40,6 +41,7 @@ void step(Settings& s, int row, int dir) {
+             break;
+         }
+         case kDisplay: s.display = wrap(s.display + dir, 3); break;
++        case kNativeDuo: s.native_duo = !s.native_duo; break;
+         case kFilter: s.filter = wrap(s.filter + dir, 4); break;
+         case kGyro: s.gyro = !s.gyro; break;
+         case kRumble: s.rumble = !s.rumble; break;
+@@ -142,6 +144,7 @@ View view() {
+     v.rows[kFps] = {"Frame rate", s.fps >= 60 ? "60 fps" : "30 fps (original)"};
+     v.rows[kScale] = {"Resolution", scale_text(s.scale)};
+     v.rows[kDisplay] = {"Aspect", kDisplays[std::clamp(s.display, 0, 2)]};
++    v.rows[kNativeDuo] = {"Native Duo 317:223", s.native_duo ? "On (restart)" : "Off"};
+     v.rows[kFilter] = {"Upscale filter", kFilters[std::clamp(s.filter, 0, 3)]};
+     v.rows[kGyro] = {"Gyro aiming", s.gyro ? "On" : "Off"};
+     v.rows[kRumble] = {"Rumble", s.rumble ? "On" : "Off"};
+@@ -151,7 +154,11 @@ View view() {
+     snprintf(b, sizeof b, "%d%%", s.volume);
+     v.rows[kVolume] = {"Volume", b};
+     v.rows[kClose] = {"Close", "", true};
+-    snprintf(b, sizeof b, "Rendering at %gx now; resolution changes apply after a restart.", g_render_scale);
++    if (native_duo::active())
++        snprintf(b, sizeof b, "Native Duo prototype: %dx%d; setting changes apply after a restart.",
++                 native_duo::kRenderWidth, native_duo::kRenderHeight);
++    else
++        snprintf(b, sizeof b, "Rendering at %gx now; resolution changes apply after a restart.", g_render_scale);
+     v.note = b;
+     return v;
+ }
+diff --git a/runtime/src/latte/latte.h b/runtime/src/latte/latte.h
+index 1f2038a..ede1363 100644
+--- a/runtime/src/latte/latte.h
++++ b/runtime/src/latte/latte.h
+@@ -36,7 +36,7 @@ void resize_window(int width, int height);
+ // GX2SetTVBuffer / GX2SetDRCBuffer: whether the scan-out buffer is sRGB (output gamma-encodes)
+ void set_scanout_srgb(bool tv, bool srgb);
+ // How the image fills the window: 0 keep aspect (letterbox), 1 stretch, 2 fill and crop
+-void set_display_mode(int mode);
++void set_display_mode(int mode);  // 0 Fit, 1 Stretch, 2 Fill, 3 validated native-aspect presentation
+ // Output scaling filter: 0 bilinear, 1 bicubic, 2 hermite, 3 nearest
+ void set_output_filter(int filter);
+ void init();
 diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
-index 5b5932e..2e729d4 100644
+index 5b5932e..36e7bae 100644
 --- a/runtime/src/main.cpp
 +++ b/runtime/src/main.cpp
-@@ -37,6 +37,13 @@ extern "C" PPC_NORETURN void rt_fatal_exit(void) {
- bool debug_watch_fault(void* addr, void* uctx);
- void debug_watch_init();
- 
-+#ifdef BOTW_SPLIT_HOST
-+extern "C" void botw_boot_step(const char* name);
-+#define BOOT_STEP(name) botw_boot_step(name)
-+#else
-+#define BOOT_STEP(name)
-+#endif
-+
- static void on_fault(int sig, siginfo_t* si, void* uctx) {
-     if (debug_watch_fault(si->si_addr, uctx)) return;
-     uintptr_t a = (uintptr_t)si->si_addr, base = (uintptr_t)g_mem;
-@@ -97,10 +104,15 @@ int main(int argc, char** argv) {
-         _exit(6);
-     });
- 
-+    BOOT_STEP("mem_init");
+@@ -16,6 +16,7 @@
+ #include "os.h"
+ #include "settings.h"
+ #include "thread.h"
++#include "game/native_duo.h"
+ #include "host/window.h"
+ #include "latte/latte.h"
+
+@@ -26,6 +27,7 @@ bool g_headless = false;
+ bool g_mute = false;       // no audio output (on-screen test runs)
+ int g_run_seconds = 0;     // --seconds N: exit after N seconds (tests)
+ float g_render_scale = 0;  // --scale N: render targets N times the native 1280x720 (graphic_pack_shim.cpp); 0 = fit the display
++float g_render_scale_x = 1, g_render_scale_y = 1;
+ int g_target_fps = 60;       // --fps 30: the game's own pacing (game/fps.cpp)
+ uint64_t g_trace_from = 0, g_trace_to = 0;  // --trace-frames A-B: HLE call trace for frames [A, B)
+
+@@ -72,6 +74,8 @@ int main(int argc, char** argv) {
+         else if (a == "--seconds" && i + 1 < argc) g_run_seconds = atoi(argv[++i]);
+         else if (a == "--fps" && i + 1 < argc) opt.fps = atoi(argv[++i]) >= 60 ? 60 : 30;
+         else if (a == "--scale" && i + 1 < argc) opt.scale = (float)atof(argv[++i]);
++        else if (a == "--native-duo") opt.native_duo = true;
++        else if (a == "--no-native-duo") opt.native_duo = false;
+         else if (a == "--display" && i + 1 < argc) {  // fit (letterbox) | stretch | fill (crop to cover)
+             std::string m = argv[++i];
+             opt.display = m == "stretch" ? 1 : m == "fill" ? 2 : 0;
+@@ -99,16 +103,31 @@ int main(int argc, char** argv) {
+
      mem::init();
-+    BOOT_STEP("dispatch_init");
      dispatch::init();
-+    BOOT_STEP("load_main");
-     if (!loader::load_main(g_game_root + "/code/U-King.rpx")) return 1;
-+    BOOT_STEP("os_init");
+-    if (!loader::load_main(g_game_root + "/code/U-King.rpx")) return 1;
++    const std::string rpx_path = g_game_root + "/code/U-King.rpx";
++    if (!loader::load_main(rpx_path)) return 1;
++    if (!native_duo::configure(opt.native_duo, rpx_path)) {
++        opt.native_duo = false;
++        opt.display = 0;  // validation failure must always return to the non-destructive Fit path
++        settings::set(opt, false);
++    } else if (native_duo::active()) {
++        opt.display = 0;  // Keep the persisted fallback proportional; apply() selects native presentation now.
++        settings::set(opt, false);
++    }
      os::init();
-+    BOOT_STEP("window");
      window::create();
-     if (g_render_scale <= 0) {  // render at the display's native resolution, so fullscreen is 1:1
+-    if (g_render_scale <= 0) {  // render at the display's native resolution, so fullscreen is 1:1
++    if (native_duo::active()) {
++        g_render_scale_x = native_duo::kRenderWidth / 1280.0f;
++        g_render_scale_y = native_duo::kRenderHeight / 720.0f;
++        g_render_scale = g_render_scale_x;
++        LOG("Native Duo: render scales %.3fx / %.3fy", g_render_scale_x, g_render_scale_y);
++    } else if (g_render_scale <= 0) {  // render at the display's native resolution, so fullscreen is 1:1
          int dw, dh;
-@@ -113,7 +125,9 @@ int main(int argc, char** argv) {
+         window::display_pixel_size(&dw, &dh);
+         g_render_scale = std::clamp(std::min(dw / 1280.0f, dh / 720.0f), 1.0f, 3.0f);
+         LOG("render scale %.3f (%dx%d for a %dx%d display)", g_render_scale, (int)(1280 * g_render_scale),
+             (int)(720 * g_render_scale), dw, dh);
+     }
++    if (!native_duo::active()) g_render_scale_x = g_render_scale_y = g_render_scale;
+     debug_watch_init();
      if (capture_every) latte::set_capture(capture_every, (g_user_root + "/captures").c_str());
- 
-     uint32_t argv_g = os::build_argv("U-King.rpx");
-+    BOOT_STEP("game_thread");
-     threads::start_main(loader::main_module().entry, 1, argv_g, loader::main_module().stack_size);
-     os::host_main_loop();  // returns when the game exits or the time limit is reached
-+    BOOT_STEP("host_loop_ended");
-     return 0;
+
+diff --git a/runtime/src/settings.cpp b/runtime/src/settings.cpp
+index 1aec13f..b4127f0 100644
+--- a/runtime/src/settings.cpp
++++ b/runtime/src/settings.cpp
+@@ -6,6 +6,7 @@
+ #include <mutex>
+
+ #include "audio/output.h"
++#include "game/native_duo.h"
+ #include "host/touch.h"
+ #include "host/window.h"
+ #include "latte/latte.h"
+@@ -23,8 +24,8 @@ void save_locked() {
+     FILE* f = fopen(g_path.c_str(), "w");
+     if (!f) return;
+     fprintf(f, "# BotWRecomp settings (also editable from the in-game menu: touchpad, L3+R3 or F1)\n");
+-    fprintf(f, "fps=%d\nscale=%g\ndisplay=%d\nfilter=%d\ngyro=%d\nrumble=%d\nlayout=%d\nshow_fps=%d\nvolume=%d\ntouch=%d\ntouch_hidden=%d\n", g_s.fps,
+-            g_s.scale, g_s.display, g_s.filter, g_s.gyro, g_s.rumble, g_s.layout, g_s.show_fps, g_s.volume, g_s.touch, g_s.touch_hidden);
++    fprintf(f, "fps=%d\nscale=%g\ndisplay=%d\nnative_duo=%d\nfilter=%d\ngyro=%d\nrumble=%d\nlayout=%d\nshow_fps=%d\nvolume=%d\ntouch=%d\ntouch_hidden=%d\n", g_s.fps,
++            g_s.scale, g_s.display, g_s.native_duo, g_s.filter, g_s.gyro, g_s.rumble, g_s.layout, g_s.show_fps, g_s.volume, g_s.touch, g_s.touch_hidden);
+     fclose(f);
  }
-diff --git a/runtime/src/snd/ax_ist.cpp b/runtime/src/snd/ax_ist.cpp
-index d400b73..b9ef5b7 100644
---- a/runtime/src/snd/ax_ist.cpp
-+++ b/runtime/src/snd/ax_ist.cpp
-@@ -6,6 +6,7 @@
- // AXOut_update timing) and calls guest callbacks with guest_call. Device remix matrices
- // (AXSetDeviceRemixMatrix) are not imported by BotW and are left out.
- #include <pthread.h>
-+#include "../../cemu_shims/botw_perf.h"
- 
- #include <atomic>
- #include <chrono>
-@@ -863,13 +864,30 @@ namespace snd_core
- 				nextFrame += pacing < 0 ? kWaitDurationFast : (pacing > 0 ? kWaitDurationSlow : kWaitDuration);
- 				auto now = clock::now();
- 				if (now - nextFrame >= kTimeout)
-+				{
- 					nextFrame = now; // too far behind (stall, debugger): skip forward
-+#ifdef BOTW_SPLIT_HOST
-+					botw_perf::g_audio_skips.fetch_add(1, std::memory_order_relaxed);
-+#endif
-+				}
- 				auto wakeTime = std::max(nextFrame, lastFrame + kWaitDurationMinimum);
- 				if (s_istCond.wait_until(lock, wakeTime, [] { return s_istStopRequested; }))
- 					break;
- 				lock.unlock();
-+#ifdef BOTW_SPLIT_HOST
-+				const auto botw_perf_begin = clock::now();
-+				if (botw_perf::g_enabled.load(std::memory_order_relaxed))
-+				{
-+					botw_perf::raise_max(botw_perf::g_audio_gap_max_ns, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(botw_perf_begin - lastFrame).count());
-+					botw_perf::g_audio_frames.fetch_add(1, std::memory_order_relaxed);
-+				}
-+#endif
- 				lastFrame = clock::now();
- 				AXIst_GenerateFrame();
-+#ifdef BOTW_SPLIT_HOST
-+				if (botw_perf::g_enabled.load(std::memory_order_relaxed))
-+					botw_perf::raise_max(botw_perf::g_audio_work_max_ns, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - botw_perf_begin).count());
-+#endif
- 				numProcessedFrames++;
- 				lock.lock();
- 			}
-diff --git a/runtime/src/snd/ax_out.cpp b/runtime/src/snd/ax_out.cpp
-index ebb7299..59aa3d0 100644
---- a/runtime/src/snd/ax_out.cpp
-+++ b/runtime/src/snd/ax_out.cpp
-@@ -6,6 +6,7 @@
- // AXOut_update does lives in the AX thread (ax_ist.cpp) and only asks this file for a device hint.
- // The remote speaker API (AXRmt*) reports no samples.
- #include "../audio/output.h"
-+#include "../../cemu_shims/botw_perf.h"
- #include "ax.h"
- #include "ax_internal.h"
- 
-@@ -310,6 +311,9 @@ namespace snd_core
- 			s_deviceActive = true;
- 		if (!s_deviceActive)
- 			return 0;
-+#ifdef BOTW_SPLIT_HOST
-+		botw_perf::audio_queue((uint64_t)queued);
-+#endif
- 		if (queued < kLowWaterFrames)
- 			return -1;
- 		if (queued > kHighWaterFrames)
+ }  // namespace
+@@ -37,7 +38,10 @@ Settings get() {
+ void apply() {
+     Settings s = get();
+     g_target_fps = s.fps;
+-    latte::set_display_mode(s.display);
++    // Native Duo's projection already targets 317:223. Presenting its 1536x1080 backing texture
++    // over the full drawable compensates the backing pixel grid without changing the final geometry.
++    // Validation failure leaves active() false and therefore returns immediately to proportional Fit.
++    latte::set_display_mode(native_duo::active() ? 3 : s.display);
+     latte::set_output_filter(s.filter);
+     window::set_gyro(s.gyro);
+     window::set_rumble(s.rumble);
+@@ -70,6 +74,7 @@ void load(const std::string& path) {
+                 if (!strcmp(line, "fps")) g_s.fps = atoi(v) >= 60 ? 60 : 30;
+                 else if (!strcmp(line, "scale")) g_s.scale = (float)atof(v);
+                 else if (!strcmp(line, "display")) g_s.display = atoi(v);
++                else if (!strcmp(line, "native_duo")) g_s.native_duo = atoi(v) != 0;
+                 else if (!strcmp(line, "filter")) g_s.filter = atoi(v);
+                 else if (!strcmp(line, "gyro")) g_s.gyro = atoi(v) != 0;
+                 else if (!strcmp(line, "rumble")) g_s.rumble = atoi(v) != 0;
+diff --git a/runtime/src/settings.h b/runtime/src/settings.h
+index aeb2e1b..bd911e4 100644
+--- a/runtime/src/settings.h
++++ b/runtime/src/settings.h
+@@ -13,6 +13,7 @@ struct Settings {
+     float scale = 0;       // render scale; 0 = fit the display (takes effect at the next launch)
+ #endif
+     int display = 0;       // 0 fit (letterbox), 1 stretch, 2 fill (crop)
++    bool native_duo = false;  // 317:223 projection prototype; validated and applied at the next launch
+     int filter = 1;        // output scaling: 0 bilinear, 1 bicubic, 2 hermite, 3 nearest
+     bool gyro = true;      // controller gyro -> GamePad motion
+     bool rumble = true;

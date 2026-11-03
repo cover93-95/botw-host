@@ -88,6 +88,11 @@ jobs:
         run: |
           mkdir -p out/licenses/botw out/licenses/cemu out/licenses/sdl3 out/licenses/fmt out/licenses/zstd
           nm -gU build/BotWRecomp.app/BotWRecomp | awk '{print $3}' | sort -u > out/host_exports.txt
+
+          test "$(lipo -archs build/BotWRecomp.app/BotWRecomp)" = arm64
+          for symbol in _hook_0x02e2c578 _hook_0x0386d020 _hook_0x035b0a38; do
+            grep -Fx "$symbol" out/host_exports.txt
+          done
           ditto -c -k --keepParent build/BotWRecomp.app out/BotWHost.app.zip
           cp botw/LICENSE out/licenses/botw/
           cp botw/runtime/cemu/LICENSE.txt out/licenses/cemu/
