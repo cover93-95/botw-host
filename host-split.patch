@@ -828,10 +828,10 @@ index dee5dcb..42f7165 100644
      cargv.push_back(nullptr);
 diff --git a/ios/src/perf_ios.mm b/ios/src/perf_ios.mm
 new file mode 100644
-index 0000000..29bd311
+index 0000000..41da822
 --- /dev/null
 +++ b/ios/src/perf_ios.mm
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,307 @@
 +// Writes the measurements of cemu_shims/botw_perf.h every 5 s from a low-priority thread, one folder per run, in
 +// <Documents>/perf/<date-time>/: frames.csv, spikes.csv (each long frame and what held it up), threads.csv (CPU time by
 +// thread name) and meta.txt. perf/perf_report.py reads them. <Documents>/botw_tune.txt chooses the level: perf=full,
@@ -856,6 +856,7 @@ index 0000000..29bd311
 +
 +#include "../../runtime/cemu_shims/botw_perf.h"
 +#include "../../runtime/cemu_shims/botw_tune.h"
++#include "../../runtime/cemu_shims/botw_diag_tables.h"
 +#include "split_ios.h"
 +
 +extern float g_render_scale;
@@ -864,6 +865,7 @@ index 0000000..29bd311
 +std::string main_wait_report();
 +}
 +std::string botw_lock_report(double t_s);
++std::string botw_yield_report(double t_s);
 +
 +namespace {
 +constexpr int kWindowSeconds = 5;
@@ -942,6 +944,9 @@ index 0000000..29bd311
 +    fflush(out);
 +}
 +
++FILE* g_yields_out = nullptr;
++FILE* g_passes_out = nullptr;
++
 +struct Files {
 +    FILE* frames;
 +    FILE* spikes;
@@ -1007,6 +1012,14 @@ index 0000000..29bd311
 +        if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) {
 +            fputs(botw_lock_report(t_s).c_str(), files.locks);
 +            fflush(files.locks);
++        }
++        if (g_yields_out) {
++            fputs(botw_yield_report(t_s).c_str(), g_yields_out);
++            fflush(g_yields_out);
++        }
++        if (g_passes_out) {
++            fputs(botw_diag::pass_table().report(t_s).c_str(), g_passes_out);
++            fflush(g_passes_out);
 +        }
 +        if (!scale_noted && g_render_scale > 0) {
 +            scale_noted = true;
@@ -1091,6 +1104,8 @@ index 0000000..29bd311
 +    for (const auto& entry : tune.values)
 +        if (!botw_tune::known(entry.first)) meta_line("tune_unknown=" + entry.first);
 +    if (safe) meta_line("experiments_ignored=safe_mode");
++    meta_line("corrections_active=" + std::to_string(safe ? 0 : botw_tune::corrections_active(tune)));
++    if (!safe && botw_tune::corrections_active(tune) > 1) meta_line("tune_warning=several corrections: this session proves nothing about any of them");
 +
 +    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil usingBlock:^(NSNotification*) {
 +        g_memory_warnings.fetch_add(1, std::memory_order_relaxed);
@@ -1101,6 +1116,23 @@ index 0000000..29bd311
 +    botw_perf::g_enabled.store(full, std::memory_order_relaxed);
 +    botw_perf::g_locks_on.store(full && botw_tune::enabled("diag_locks"), std::memory_order_relaxed);
 +    botw_perf::g_gpu_diag.store(full && botw_tune::enabled("diag_gpu"), std::memory_order_relaxed);
++    if (full && (botw_tune::enabled("diag_passes") || botw_tune::enabled("diag_pass_gpu"))) {
++        g_passes_out = fopen((path + "/passes.csv").c_str(), "w");
++        if (g_passes_out) {
++            fprintf(g_passes_out, "%s\n", botw_diag::kPassHeader);
++            fflush(g_passes_out);
++            botw_diag::g_passes_on.store(true, std::memory_order_relaxed);
++            botw_diag::g_pass_gpu_on.store(botw_tune::enabled("diag_pass_gpu"), std::memory_order_relaxed);
++        }
++    }
++    if (full && botw_tune::enabled("diag_yields")) {
++        g_yields_out = fopen((path + "/yields.csv").c_str(), "w");
++        if (g_yields_out) {
++            fprintf(g_yields_out, "%s\n", botw_diag::kYieldHeader);
++            fflush(g_yields_out);
++            botw_diag::g_yields_on.store(true, std::memory_order_relaxed);
++        }
++    }
 +    std::thread(write_loop, files, full).detach();
 +    if (const long stall_ms = botw_tune::integer(botw_tune::current(), "diag_stall_ms", 0, 0, 1000)) {
 +        if (FILE* stalls = fopen((path + "/stalls.csv").c_str(), "w")) std::thread(stall_loop, stalls, (uint64_t)stall_ms * 1000000, botw_tune::enabled("diag_stall_stacks")).detach();
@@ -1405,18 +1437,33 @@ index ddc9417..05d2759 100644
      m_drawable = nullptr;
  }
 diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalMemoryManager.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalMemoryManager.cpp
-index d2fac40..1527bcb 100644
+index d2fac40..daf7d2c 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalMemoryManager.cpp
 +++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalMemoryManager.cpp
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,8 @@
  #include "Common/precompiled.h"
  #include "HW/MMU/MMU.h"
  #include "config/CemuConfig.h"
 +#include "botw_perf.h"
++#include "botw_tune.h"
  
  MetalMemoryManager::~MetalMemoryManager()
  {
-@@ -97,10 +98,20 @@ void MetalMemoryManager::UploadToBufferCache(const void* data, size_t offset, si
+@@ -63,6 +65,13 @@ void MetalMemoryManager::InitBufferCache(size_t size)
+         }
+     }
+ 
++#ifdef BOTW_SPLIT_HOST
++    // metal_cache_shared=1: the mode Auto already gives some titles. Uploads no longer need a blit, so they stop ending
++    // passes; but the CPU then writes data an earlier, unfinished draw may still read. Look for visual errors.
++    if (m_metalBufferCacheMode == MetalBufferCacheMode::DevicePrivate && m_mtlr->IsAppleGPU() && botw_tune::enabled("metal_cache_shared"))
++        m_metalBufferCacheMode = MetalBufferCacheMode::DeviceShared;
++#endif
++
+     // First, try to import the host memory as a buffer
+     if (m_metalBufferCacheMode == MetalBufferCacheMode::Host)
+     {
+@@ -97,10 +106,20 @@ void MetalMemoryManager::UploadToBufferCache(const void* data, size_t offset, si
      cemu_assert_debug(m_metalBufferCacheMode != MetalBufferCacheMode::Host);
      cemu_assert_debug(m_bufferCache);
      cemu_assert_debug((offset + size) <= m_bufferCache->length());
@@ -1437,7 +1484,7 @@ index d2fac40..1527bcb 100644
  
          auto allocation = m_stagingAllocator.AllocateBufferMemory(size, 1);
          memcpy(allocation.memPtr, data, size);
-@@ -114,10 +125,18 @@ void MetalMemoryManager::UploadToBufferCache(const void* data, size_t offset, si
+@@ -114,10 +133,18 @@ void MetalMemoryManager::UploadToBufferCache(const void* data, size_t offset, si
      {
          memcpy((uint8*)m_bufferCache->contents() + offset, data, size);
      }
@@ -1573,20 +1620,33 @@ index 6193ab1..be576dc 100644
  
      auto creationDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
-index 51c61bc..dc65ee0 100644
+index 51c61bc..6f8a0b7 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
 +++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
-@@ -26,6 +26,9 @@
+@@ -26,6 +26,10 @@
  #define IMGUI_IMPL_METAL_CPP
  #include "imgui/imgui_extension.h"
  #include "imgui/imgui_impl_metal.h"
 +#include "botw_perf.h"
 +#include "botw_tune.h"
 +#include "botw_draw_cache.h"
++#include "botw_diag_tables.h"
  
  #define EVENT_VALUE_WRAP 4096
  
-@@ -379,6 +382,7 @@ void MetalRenderer::DrawEmptyFrame(bool mainWindow)
+@@ -230,6 +234,11 @@ MetalRenderer::MetalRenderer() : Renderer(RendererAPI::Metal)
+         m_defaultCommitTreshlod = 64;
+     else
+         m_defaultCommitTreshlod = 196;
++#ifdef BOTW_SPLIT_HOST
++    // metal_commit_threshold=N: fewer or more command buffers per frame. 0, or a value out of range, keeps the default.
++    if (const long commitThreshold = botw_tune::integer(botw_tune::current(), "metal_commit_threshold", 0, 64, 1024))
++        m_defaultCommitTreshlod = (uint32)commitThreshold;
++#endif
+ 
+     // Occlusion queries
+     m_occlusionQuery.m_resultBuffer = m_device->newBuffer(OCCLUSION_QUERY_POOL_SIZE * sizeof(uint64), MTL::ResourceStorageModeShared);
+@@ -379,6 +388,7 @@ void MetalRenderer::DrawEmptyFrame(bool mainWindow)
  
  void MetalRenderer::SwapBuffers(bool swapTV, bool swapDRC)
  {
@@ -1594,7 +1654,17 @@ index 51c61bc..dc65ee0 100644
      if (swapTV)
          SwapBuffer(true);
      if (swapDRC)
-@@ -551,7 +555,10 @@ void MetalRenderer::Flush(bool waitIdle)
+@@ -386,6 +396,9 @@ void MetalRenderer::SwapBuffers(bool swapTV, bool swapDRC)
+ 
+     // Reset the command buffers (they are released by TemporaryBufferAllocator)
+     CommitCommandBuffer();
++#ifdef BOTW_SPLIT_HOST
++    BotwPassGpuFrame();
++#endif
+ 
+     // Debug
+     m_performanceMonitor.ResetPerFrameData();
+@@ -551,7 +564,10 @@ void MetalRenderer::Flush(bool waitIdle)
          CommitCommandBuffer();
  
      if (waitIdle && m_executingCommandBuffers.size() != 0)
@@ -1605,7 +1675,7 @@ index 51c61bc..dc65ee0 100644
  }
  
  void MetalRenderer::NotifyLatteCommandProcessorIdle()
-@@ -1228,7 +1235,12 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32
+@@ -1228,7 +1244,12 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32
      // Render pipeline state
      PipelineObject* pipelineObj = m_pipelineCache->GetRenderPipelineState(fetchShader, vertexShader, geometryShader, pixelShader, m_state.m_lastUsedFBO.m_attachmentsInfo, m_state.m_activeFBO.m_attachmentsInfo, m_state.m_activeFBO.m_fbo->m_size, count, LatteGPUState.contextNew);
      if (!pipelineObj->m_pipeline)
@@ -1618,7 +1688,7 @@ index 51c61bc..dc65ee0 100644
  
      if (pipelineObj->m_pipeline != encoderState.m_renderPipelineState)
     	{
-@@ -1472,6 +1484,9 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32
+@@ -1472,6 +1493,9 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32
  	}
  
  	m_state.m_isFirstDrawInRenderPass = false;
@@ -1628,7 +1698,7 @@ index 51c61bc..dc65ee0 100644
  
  	// Occlusion queries
  	if (m_occlusionQuery.m_active)
-@@ -1631,7 +1646,10 @@ void MetalRenderer::occlusionQuery_destroy(LatteQueryObject* queryObj) {
+@@ -1631,7 +1655,10 @@ void MetalRenderer::occlusionQuery_destroy(LatteQueryObject* queryObj) {
  
  void MetalRenderer::occlusionQuery_flush() {
      if (m_occlusionQuery.m_lastCommandBuffer)
@@ -1639,7 +1709,7 @@ index 51c61bc..dc65ee0 100644
  }
  
  void MetalRenderer::occlusionQuery_updateState() {
-@@ -1756,6 +1774,9 @@ MTL::CommandBuffer* MetalRenderer::GetCommandBuffer()
+@@ -1756,6 +1783,9 @@ MTL::CommandBuffer* MetalRenderer::GetCommandBuffer()
  
  		m_recordedDrawcalls = 0;
  		m_commitTreshold = m_defaultCommitTreshlod;
@@ -1649,13 +1719,13 @@ index 51c61bc..dc65ee0 100644
  
          // Debug
          m_performanceMonitor.m_commandBuffers++;
-@@ -1768,11 +1789,41 @@ MTL::CommandBuffer* MetalRenderer::GetCommandBuffer()
+@@ -1768,15 +1798,171 @@ MTL::CommandBuffer* MetalRenderer::GetCommandBuffer()
  	}
  }
  
 +#ifdef BOTW_SPLIT_HOST
 +// What opening a pass on this FBO moves: CachedFBOMtl loads and stores every attachment. Before compression, in bytes.
-+static void BotwNotePassAttachments(CachedFBOMtl* fbo)
++static uint64 BotwNotePassAttachments(CachedFBOMtl* fbo, botw_diag::PassKey& key)
 +{
 +    uint64 attachments = 0, bytes = 0;
 +    const auto add = [&](LatteTextureView* view, bool isDepth) {
@@ -1663,16 +1733,134 @@ index 51c61bc..dc65ee0 100644
 +        view->baseTexture->GetEffectiveSize(width, height, view->firstMip);
 +        attachments++;
 +        bytes += (uint64)width * height * GetMtlPixelFormatInfo(view->baseTexture->format, isDepth).bytesPerBlock;
++        key.width = std::max(key.width, (uint32)width);
++        key.height = std::max(key.height, (uint32)height);
 +    };
 +    for (uint8 i = 0; i < 8; i++)
 +    {
 +        if (fbo->colorBuffer[i].texture)
++        {
 +            add(fbo->colorBuffer[i].texture, false);
++            if (key.colors++ == 0)
++                key.color_format = (uint32)fbo->colorBuffer[i].texture->baseTexture->format;
++        }
 +    }
 +    if (fbo->depthBuffer.texture)
++    {
 +        add(fbo->depthBuffer.texture, true);
++        key.depth_format = (uint32)fbo->depthBuffer.texture->baseTexture->format;
++    }
 +    botw_perf::g_attachments.fetch_add(attachments, std::memory_order_relaxed);
 +    botw_perf::g_attach_bytes.fetch_add(bytes, std::memory_order_relaxed);
++    return bytes;
++}
++
++// diag_pass_gpu: a timestamp counter set, or this stays off and meta.txt says why. Stage boundaries are the only
++// sampling point Apple's GPUs offer for passes.
++bool MetalRenderer::BotwPassGpuInit()
++{
++    if (m_passSamples)
++        return true;
++    if (!m_device->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary))
++    {
++        botw_perf_note("pass_gpu=no stage boundary sampling");
++        return false;
++    }
++    auto pool = NS::AutoreleasePool::alloc()->init();
++    MTL::CounterSet* timestamps = nullptr;
++    NS::Array* sets = m_device->counterSets();
++    for (NS::UInteger i = 0; sets && i < sets->count(); i++)
++    {
++        auto set = sets->object<MTL::CounterSet>(i);
++        if (set->name()->isEqualToString(MTL::CommonCounterSetTimestamp))
++            timestamps = set;
++    }
++    if (timestamps)
++    {
++        auto descriptor = MTL::CounterSampleBufferDescriptor::alloc()->init();
++        descriptor->setCounterSet(timestamps);
++        descriptor->setStorageMode(MTL::StorageModeShared);
++        descriptor->setSampleCount(4096);
++        NS::Error* error = nullptr;
++        m_passSamples = m_device->newCounterSampleBuffer(descriptor, &error);
++        descriptor->release();
++    }
++    pool->release();
++    if (!m_passSamples)
++    {
++        botw_perf_note(timestamps ? "pass_gpu=no sample buffer" : "pass_gpu=no timestamp counters");
++        return false;
++    }
++    m_device->sampleTimestamps(&m_passCpu0, &m_passGpu0);
++    botw_perf_note("pass_gpu=on");
++    return true;
++}
++
++bool MetalRenderer::BotwAttachPassSamples(MTL::RenderPassDescriptor* descriptor, uint32 slot)
++{
++    if (!m_passCapturing || m_passSampleNext + 4 > 4096)
++        return false;
++    auto attachment = descriptor->sampleBufferAttachments()->object(0);
++    attachment->setSampleBuffer(m_passSamples);
++    attachment->setStartOfVertexSampleIndex(m_passSampleNext);
++    attachment->setEndOfVertexSampleIndex(m_passSampleNext + 1);
++    attachment->setStartOfFragmentSampleIndex(m_passSampleNext + 2);
++    attachment->setEndOfFragmentSampleIndex(m_passSampleNext + 3);
++    m_passCaptured.push_back({slot, m_passSampleNext, false});
++    m_passSampleNext += 4;
++    return true;
++}
++
++// Once per frame, after its last commit: reads a finished capture, then starts the next one.
++void MetalRenderer::BotwPassGpuFrame()
++{
++    if (!botw_diag::g_pass_gpu_on.load(std::memory_order_relaxed))
++        return;
++    if (m_passCapturing)
++    {
++        m_passCapturing = false;
++        if (!m_executingCommandBuffers.empty())
++            m_passCaptureLast = m_executingCommandBuffers.back()->retain();
++    }
++    if (m_passCaptureLast)
++    {
++        if (!CommandBufferCompleted(m_passCaptureLast))
++            return;
++        m_passCaptureLast->release();
++        m_passCaptureLast = nullptr;
++        MTL::Timestamp cpu = 0, gpu = 0;
++        m_device->sampleTimestamps(&cpu, &gpu);
++        const double nsPerTick = gpu > m_passGpu0 ? (double)(cpu - m_passCpu0) / (double)(gpu - m_passGpu0) : 1.0;
++        auto pool = NS::AutoreleasePool::alloc()->init();
++        NS::Data* data = m_passSampleNext ? m_passSamples->resolveCounterRange(NS::Range::Make(0, m_passSampleNext)) : nullptr;
++        if (data)
++        {
++            const uint64* stamps = reinterpret_cast<const uint64*>(data->mutableBytes());
++            const auto span = [&](uint32 from) -> uint64 {
++                const uint64 begin = stamps[from], end = stamps[from + 1];
++                if (!begin || begin == ~0ull || end == ~0ull || end < begin)
++                    return ~0ull;
++                return (uint64)((end - begin) * nsPerTick);
++            };
++            for (const BotwPassSample& sample : m_passCaptured)
++            {
++                const uint64 first = span(sample.first);
++                const uint64 second = sample.blit ? 0 : span(sample.first + 2);
++                if (first != ~0ull && second != ~0ull)
++                    botw_diag::pass_table().note_gpu(sample.slot, sample.blit ? 0 : first, sample.blit ? first : second);
++            }
++        }
++        pool->release();
++        m_passCaptured.clear();
++        m_passSampleNext = 0;
++    }
++    if (++m_passFrame % 120 == 0)
++    {
++        if (BotwPassGpuInit())
++            m_passCapturing = true;
++        else
++            botw_diag::g_pass_gpu_on.store(false, std::memory_order_relaxed);
++    }
 +}
 +#endif
 +
@@ -1681,47 +1869,79 @@ index 51c61bc..dc65ee0 100644
 +#ifdef BOTW_SPLIT_HOST
 +    if (m_commandEncoder && m_encoderType == MetalEncoderType::Render)
 +        botw_perf::g_pass_breaks_clear.fetch_add(1, std::memory_order_relaxed);
++    m_passEnd = botw_diag::kEndClear;
 +#endif
      EndEncoding();
  
      auto commandBuffer = GetCommandBuffer();
 +#ifdef BOTW_SPLIT_HOST
 +    botw_perf::g_clear_passes.fetch_add(1, std::memory_order_relaxed);
++    if (botw_diag::g_passes_on.load(std::memory_order_relaxed))
++        botw_diag::pass_table().note_pass(botw_diag::PassTable::kOtherSlot, 0, 0, false, botw_diag::kEndOther);
++    const bool sampled = BotwAttachPassSamples(renderPassDescriptor, botw_diag::PassTable::kOtherSlot);
 +#endif
  
      auto pool = NS::AutoreleasePool::alloc()->init();
      auto renderCommandEncoder = commandBuffer->renderCommandEncoder(renderPassDescriptor)->retain();
-@@ -1838,6 +1889,12 @@ MTL::RenderCommandEncoder* MetalRenderer::GetRenderCommandEncoder(bool forceRecr
+     pool->release();
++#ifdef BOTW_SPLIT_HOST
++    if (sampled)
++        renderPassDescriptor->sampleBufferAttachments()->object(0)->setSampleBuffer(nullptr);
++#endif
+ #ifdef CEMU_DEBUG_ASSERT
+     renderCommandEncoder->setLabel(GetLabel("Temporary render command encoder", renderCommandEncoder));
+ #endif
+@@ -1834,14 +2020,30 @@ MTL::RenderCommandEncoder* MetalRenderer::GetRenderCommandEncoder(bool forceRecr
+             }
+         }
+ 
++#ifdef BOTW_SPLIT_HOST
++        m_passEnd = botw_diag::kEndFbo;
++#endif
+         EndEncoding();
      }
  
      auto commandBuffer = GetCommandBuffer();
 +#ifdef BOTW_SPLIT_HOST
 +    botw_perf::g_render_passes.fetch_add(1, std::memory_order_relaxed);
-+    BotwNotePassAttachments(m_state.m_activeFBO.m_fbo);
++    botw_diag::PassKey passKey;
++    m_passBytes = BotwNotePassAttachments(m_state.m_activeFBO.m_fbo, passKey);
++    m_passSlot = botw_diag::g_passes_on.load(std::memory_order_relaxed) ? botw_diag::pass_table().slot(passKey) : botw_diag::PassTable::kOverflowSlot;
 +    m_passDraws = 0;
 +    m_passCounted = true;
++    const bool sampled = BotwAttachPassSamples(m_state.m_activeFBO.m_fbo->GetRenderPassDescriptor(), m_passSlot);
 +#endif
  
      auto pool = NS::AutoreleasePool::alloc()->init();
      auto renderCommandEncoder = commandBuffer->renderCommandEncoder(m_state.m_activeFBO.m_fbo->GetRenderPassDescriptor())->retain();
-@@ -1869,6 +1926,10 @@ MTL::ComputeCommandEncoder* MetalRenderer::GetComputeCommandEncoder()
+     pool->release();
++#ifdef BOTW_SPLIT_HOST
++    if (sampled)
++        m_state.m_activeFBO.m_fbo->GetRenderPassDescriptor()->sampleBufferAttachments()->object(0)->setSampleBuffer(nullptr);
++#endif
+ #ifdef CEMU_DEBUG_ASSERT
+     renderCommandEncoder->setLabel(GetLabel("Render command encoder", renderCommandEncoder));
+ #endif
+@@ -1869,6 +2071,11 @@ MTL::ComputeCommandEncoder* MetalRenderer::GetComputeCommandEncoder()
              return (MTL::ComputeCommandEncoder*)m_commandEncoder;
          }
  
 +#ifdef BOTW_SPLIT_HOST
 +        if (m_encoderType == MetalEncoderType::Render)
 +            botw_perf::g_pass_breaks_compute.fetch_add(1, std::memory_order_relaxed);
++        m_passEnd = botw_diag::kEndCompute;
 +#endif
          EndEncoding();
      }
  
-@@ -1894,10 +1955,17 @@ MTL::BlitCommandEncoder* MetalRenderer::GetBlitCommandEncoder()
+@@ -1894,13 +2101,40 @@ MTL::BlitCommandEncoder* MetalRenderer::GetBlitCommandEncoder()
              return (MTL::BlitCommandEncoder*)m_commandEncoder;
          }
  
 +#ifdef BOTW_SPLIT_HOST
 +        if (m_encoderType == MetalEncoderType::Render)
 +            botw_perf::g_pass_breaks_blit.fetch_add(1, std::memory_order_relaxed);
++        m_passEnd = botw_diag::kEndBlit;
 +#endif
          EndEncoding();
      }
@@ -1729,11 +1949,33 @@ index 51c61bc..dc65ee0 100644
      auto commandBuffer = GetCommandBuffer();
 +#ifdef BOTW_SPLIT_HOST
 +    botw_perf::g_blit_encoders.fetch_add(1, std::memory_order_relaxed);
++    if (botw_diag::g_passes_on.load(std::memory_order_relaxed))
++        botw_diag::pass_table().note_pass(botw_diag::PassTable::kBlitSlot, 0, 0, false, botw_diag::kEndOther);
 +#endif
  
      auto pool = NS::AutoreleasePool::alloc()->init();
++#ifdef BOTW_SPLIT_HOST
++    MTL::BlitCommandEncoder* blitCommandEncoder;
++    if (m_passCapturing && m_passSampleNext + 2 <= 4096)
++    {
++        auto descriptor = MTL::BlitPassDescriptor::blitPassDescriptor();
++        auto attachment = descriptor->sampleBufferAttachments()->object(0);
++        attachment->setSampleBuffer(m_passSamples);
++        attachment->setStartOfEncoderSampleIndex(m_passSampleNext);
++        attachment->setEndOfEncoderSampleIndex(m_passSampleNext + 1);
++        m_passCaptured.push_back({botw_diag::PassTable::kBlitSlot, m_passSampleNext, true});
++        m_passSampleNext += 2;
++        blitCommandEncoder = commandBuffer->blitCommandEncoder(descriptor)->retain();
++    }
++    else
++        blitCommandEncoder = commandBuffer->blitCommandEncoder()->retain();
++#else
      auto blitCommandEncoder = commandBuffer->blitCommandEncoder()->retain();
-@@ -1914,6 +1982,14 @@ void MetalRenderer::EndEncoding()
++#endif
+     pool->release();
+     m_commandEncoder = blitCommandEncoder;
+     m_encoderType = MetalEncoderType::Blit;
+@@ -1914,6 +2148,17 @@ void MetalRenderer::EndEncoding()
  {
      if (m_commandEncoder)
      {
@@ -1742,13 +1984,31 @@ index 51c61bc..dc65ee0 100644
 +        {
 +            if (m_passDraws <= 4)
 +                botw_perf::g_short_passes.fetch_add(1, std::memory_order_relaxed);
++            if (botw_diag::g_passes_on.load(std::memory_order_relaxed))
++                botw_diag::pass_table().note_pass(m_passSlot, m_passDraws, m_passBytes, m_passDraws <= 4, m_passEnd);
 +            m_passCounted = false;
 +        }
++        m_passEnd = botw_diag::kEndOther;
 +#endif
          m_commandEncoder->endEncoding();
          m_commandEncoder->release();
          m_commandEncoder = nullptr;
-@@ -1965,6 +2041,10 @@ void MetalRenderer::ProcessFinishedCommandBuffers()
+@@ -1930,7 +2175,14 @@ void MetalRenderer::CommitCommandBuffer()
+     if (!m_currentCommandBuffer.m_commandBuffer)
+         return;
+ 
++#ifdef BOTW_SPLIT_HOST
++    if (m_passEnd == botw_diag::kEndOther)
++        m_passEnd = botw_diag::kEndCommit;
++#endif
+     EndEncoding();
++#ifdef BOTW_SPLIT_HOST
++    m_passEnd = botw_diag::kEndOther;
++#endif
+ 
+     ProcessFinishedCommandBuffers();
+ 
+@@ -1965,6 +2217,10 @@ void MetalRenderer::ProcessFinishedCommandBuffers()
          auto commandBuffer = *it;
          if (CommandBufferCompleted(commandBuffer))
          {
@@ -1759,7 +2019,7 @@ index 51c61bc..dc65ee0 100644
              m_memoryManager->CleanupBuffers(commandBuffer);
              commandBuffer->release();
              it = m_executingCommandBuffers.erase(it);
-@@ -1989,6 +2069,7 @@ bool MetalRenderer::AcquireDrawable(bool mainWindow)
+@@ -1989,6 +2245,7 @@ bool MetalRenderer::AcquireDrawable(bool mainWindow)
          m_state.m_usesSRGB = latteBufferUsesSRGB;
      }
  
@@ -1767,7 +2027,7 @@ index 51c61bc..dc65ee0 100644
      return layer.AcquireDrawable();
  }
  
-@@ -2235,12 +2316,30 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
+@@ -2235,12 +2492,30 @@ void MetalRenderer::BindStageResources(MTL::RenderCommandEncoder* renderCommandE
  		}
  
  		size_t size = shader->uniform.uniformRangeSize;
@@ -1799,16 +2059,36 @@ index 51c61bc..dc65ee0 100644
  
  	// Uniform buffers
 diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h
-index b4d21af..ed5e9c1 100644
+index b4d21af..91eedc4 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h
 +++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h
-@@ -339,6 +339,11 @@ public:
+@@ -339,6 +339,31 @@ public:
      void SetSamplerState(MTL::RenderCommandEncoder* renderCommandEncoder, MetalShaderType shaderType, MTL::SamplerState* samplerState, uint32 index);
  
  	MTL::CommandBuffer* GetCommandBuffer();
 +#ifdef BOTW_SPLIT_HOST
 +    uint32 m_passDraws = 0;       // draws in the pass opened on an FBO
 +    bool m_passCounted = false;   // such a pass is open
++    uint32 m_passSlot = 0;        // diag_passes: its row in the table
++    uint64 m_passBytes = 0;
++    uint8 m_passEnd = 0;          // why the current encoder is about to end
++    // diag_pass_gpu: timestamps around each pass and blit of one frame in 120.
++    struct BotwPassSample
++    {
++        uint32 slot;
++        uint32 first;
++        bool blit;
++    };
++    MTL::CounterSampleBuffer* m_passSamples = nullptr;
++    std::vector<BotwPassSample> m_passCaptured;
++    MTL::CommandBuffer* m_passCaptureLast = nullptr;
++    MTL::Timestamp m_passCpu0 = 0, m_passGpu0 = 0;
++    uint64 m_passFrame = 0;
++    uint32 m_passSampleNext = 0;
++    bool m_passCapturing = false;
++    void BotwPassGpuFrame();
++    bool BotwPassGpuInit();
++    bool BotwAttachPassSamples(MTL::RenderPassDescriptor* descriptor, uint32 slot);
 +    uint64 m_commandBufferGeneration = 0;   // support_dedupe: an allocation is only reused within its own command buffer
 +#endif
  	MTL::RenderCommandEncoder* GetTemporaryRenderCommandEncoder(MTL::RenderPassDescriptor* renderPassDescriptor);
@@ -1926,6 +2206,231 @@ index f00af85..efd4def 100644
      MTL::Library* library = nullptr;
  
      // First, try to retrieve the compiled shader from the AIR cache
+diff --git a/runtime/cemu_shims/botw_diag_tables.h b/runtime/cemu_shims/botw_diag_tables.h
+new file mode 100644
+index 0000000..5e76153
+--- /dev/null
++++ b/runtime/cemu_shims/botw_diag_tables.h
+@@ -0,0 +1,219 @@
++// Tables behind the v8 diagnostics, off by default (botw_tune.txt). No dependency on the game, the OS layer or Metal, so
++// that they can be tested alone and used by any port of this runtime.
++//   diag_yields=1    who calls the scheduler, from which guest address, how often and at what cost
++//   diag_passes=1    each kind of render pass: how many, how many draws, what they move, why they end
++//   diag_pass_gpu=1  and their GPU time, from timestamps on one frame in 120
++#pragma once
++#include <stdint.h>
++#include <stdio.h>
++
++#include <algorithm>
++#include <atomic>
++#include <mutex>
++#include <string>
++#include <vector>
++
++namespace botw_diag {
++inline std::atomic<bool> g_yields_on{false}, g_passes_on{false}, g_pass_gpu_on{false};
++
++// ---- scheduler calls -----------------------------------------------------------------------------------------------
++enum YieldKind : uint8_t { kYieldThread, kSleepZero, kSleepTicks, kYieldKinds };
++inline const char* yield_kind_name(uint8_t kind) {
++    static const char* const names[] = {"OSYieldThread", "OSSleepTicks0", "OSSleepTicks"};
++    return kind < kYieldKinds ? names[kind] : "?";
++}
++constexpr uint64_t kSampleEvery = 64;       // One call in 64 is timed: the clocks cost more than the call being counted.
++constexpr uint64_t kSlowNs = 20000;         // Longer than this, another thread has most likely run in between.
++
++struct YieldSite {
++    uint32_t lr = 0, caller = 0;   // The guest return address, and the one saved by its caller.
++    uint8_t kind = 0;
++    bool used = false;
++    uint64_t count = 0, sampled = 0, wall_ns = 0, cpu_ns = 0, max_ns = 0, slow = 0, gap_ns = 0, gaps = 0;
++};
++
++// One per thread. It takes a lock because the report reads it from another thread; only diag_yields pays for it.
++class YieldTable {
++public:
++    static constexpr size_t kSlots = 128;
++    explicit YieldTable(std::string name) : name_(std::move(name)) {}
++    const std::string& name() const { return name_; }
++
++    // Counts a call, and says whether to time this one.
++    bool note(uint32_t lr, uint8_t kind) {
++        std::lock_guard<std::mutex> l(lock_);
++        total_++;
++        if (YieldSite* s = find(lr, kind)) s->count++;
++        else lost_++;
++        return total_ % kSampleEvery == 1;
++    }
++    void note_sample(uint32_t lr, uint8_t kind, uint32_t caller, uint64_t wall, uint64_t cpu) {
++        std::lock_guard<std::mutex> l(lock_);
++        YieldSite* s = find(lr, kind);
++        if (!s) return;
++        s->caller = caller;
++        s->sampled++;
++        s->wall_ns += wall;
++        s->cpu_ns += cpu;
++        s->max_ns = std::max(s->max_ns, wall);
++        if (wall >= kSlowNs) s->slow++;
++    }
++    // The time from a timed call to the next scheduler call of this thread: near zero means a tight loop.
++    void note_gap(uint32_t lr, uint8_t kind, uint64_t gap) {
++        std::lock_guard<std::mutex> l(lock_);
++        YieldSite* s = find(lr, kind);
++        if (!s) return;
++        s->gap_ns += gap;
++        s->gaps++;
++    }
++    // The sites used since the last call, and the calls that found no free slot. Resets both; keeps nothing.
++    std::vector<YieldSite> drain(uint64_t& lost) {
++        std::lock_guard<std::mutex> l(lock_);
++        std::vector<YieldSite> out;
++        for (YieldSite& s : slots_) {
++            if (s.used && s.count) out.push_back(s);
++            s = YieldSite{};
++        }
++        lost = lost_;
++        lost_ = 0;
++        return out;
++    }
++
++private:
++    YieldSite* find(uint32_t lr, uint8_t kind) {
++        const uint32_t hash = (lr >> 2) * 2654435761u + kind;
++        for (size_t i = 0; i < kSlots; i++) {
++            YieldSite& s = slots_[(hash + i) % kSlots];
++            if (!s.used) {
++                s.used = true;
++                s.lr = lr;
++                s.kind = kind;
++                return &s;
++            }
++            if (s.lr == lr && s.kind == kind) return &s;
++        }
++        return nullptr;
++    }
++    std::string name_;
++    std::mutex lock_;
++    uint64_t total_ = 0, lost_ = 0;
++    YieldSite slots_[kSlots];
++};
++
++constexpr const char* kYieldHeader = "t_s,thread,kind,lr,caller,count,sampled,wall_ns,cpu_ns,max_ns,slow,gap_ns,gaps";
++
++// A window of every table, most frequent sites first, at most `top` lines plus one for the rest.
++inline std::string yield_report(double t_s, const std::vector<YieldTable*>& tables, size_t top = 32) {
++    struct Row {
++        const std::string* name;
++        YieldSite site;
++    };
++    std::vector<Row> rows;
++    uint64_t lost_total = 0;
++    for (YieldTable* t : tables) {
++        uint64_t lost = 0;
++        for (const YieldSite& s : t->drain(lost)) rows.push_back({&t->name(), s});
++        lost_total += lost;
++    }
++    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.site.count > b.site.count; });
++    uint64_t rest = lost_total;
++    for (size_t i = top; i < rows.size(); i++) rest += rows[i].site.count;
++    if (rows.size() > top) rows.resize(top);
++    std::string out;
++    char line[256];
++    for (const Row& r : rows) {
++        std::string name = *r.name;
++        std::replace(name.begin(), name.end(), ',', ';');
++        const YieldSite& s = r.site;
++        snprintf(line, sizeof line, "%.0f,%s,%s,%08x,%08x,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", t_s, name.c_str(), yield_kind_name(s.kind), s.lr, s.caller, (unsigned long long)s.count,
++                 (unsigned long long)s.sampled, (unsigned long long)s.wall_ns, (unsigned long long)s.cpu_ns, (unsigned long long)s.max_ns, (unsigned long long)s.slow, (unsigned long long)s.gap_ns, (unsigned long long)s.gaps);
++        out += line;
++    }
++    if (rest) {
++        snprintf(line, sizeof line, "%.0f,(rest),,00000000,00000000,%llu,0,0,0,0,0,0,0\n", t_s, (unsigned long long)rest);
++        out += line;
++    }
++    return out;
++}
++
++// ---- render passes -------------------------------------------------------------------------------------------------
++enum PassEnd : uint8_t { kEndOther, kEndBlit, kEndCompute, kEndClear, kEndFbo, kEndCommit, kPassEnds };
++
++struct PassKey {
++    uint32_t width = 0, height = 0, colors = 0, color_format = 0, depth_format = 0;
++    bool operator==(const PassKey& o) const { return width == o.width && height == o.height && colors == o.colors && color_format == o.color_format && depth_format == o.depth_format; }
++};
++
++constexpr const char* kPassHeader = "t_s,kind,width,height,colors,color_format,depth_format,passes,draws,short_passes,attach_bytes,end_other,end_blit,end_compute,end_clear,end_fbo,end_commit,gpu_samples,vertex_ms,fragment_ms";
++
++// Written by the render thread; the report reads it from the writer thread.
++class PassTable {
++public:
++    static constexpr uint32_t kSlots = 64, kBlitSlot = 0, kOtherSlot = 1, kOverflowSlot = 2, kFirstFree = 3;
++    PassTable() {
++        rows_[kBlitSlot].kind = "blit";
++        rows_[kOtherSlot].kind = "temporary";
++        rows_[kOverflowSlot].kind = "overflow";
++    }
++    uint32_t slot(const PassKey& key) {
++        std::lock_guard<std::mutex> l(lock_);
++        for (uint32_t i = kFirstFree; i < used_; i++)
++            if (rows_[i].key == key) return i;
++        if (used_ == kSlots) return kOverflowSlot;
++        rows_[used_].key = key;
++        rows_[used_].kind = "fbo";
++        return used_++;
++    }
++    void note_pass(uint32_t slot, uint32_t draws, uint64_t attach_bytes, bool is_short, uint8_t end) {
++        std::lock_guard<std::mutex> l(lock_);
++        Row& r = rows_[slot < kSlots ? slot : kOverflowSlot];
++        r.passes++;
++        r.draws += draws;
++        r.attach_bytes += attach_bytes;
++        r.short_passes += is_short;
++        r.ends[end < kPassEnds ? end : kEndOther]++;
++    }
++    void note_gpu(uint32_t slot, uint64_t vertex_ns, uint64_t fragment_ns) {
++        std::lock_guard<std::mutex> l(lock_);
++        Row& r = rows_[slot < kSlots ? slot : kOverflowSlot];
++        r.gpu_samples++;
++        r.vertex_ns += vertex_ns;
++        r.fragment_ns += fragment_ns;
++    }
++    // The rows with activity since the last call, most bytes first. Keeps the keys, so a slot stays valid.
++    std::string report(double t_s) {
++        std::lock_guard<std::mutex> l(lock_);
++        std::vector<Row*> active;
++        for (uint32_t i = 0; i < kSlots; i++)
++            if (rows_[i].passes || rows_[i].gpu_samples) active.push_back(&rows_[i]);
++        std::sort(active.begin(), active.end(), [](const Row* a, const Row* b) { return a->attach_bytes != b->attach_bytes ? a->attach_bytes > b->attach_bytes : a->passes > b->passes; });
++        std::string out;
++        char line[320];
++        for (Row* r : active) {
++            snprintf(line, sizeof line, "%.0f,%s,%u,%u,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.3f,%.3f\n", t_s, r->kind, r->key.width, r->key.height, r->key.colors, r->key.color_format, r->key.depth_format,
++                     (unsigned long long)r->passes, (unsigned long long)r->draws, (unsigned long long)r->short_passes, (unsigned long long)r->attach_bytes, (unsigned long long)r->ends[kEndOther], (unsigned long long)r->ends[kEndBlit],
++                     (unsigned long long)r->ends[kEndCompute], (unsigned long long)r->ends[kEndClear], (unsigned long long)r->ends[kEndFbo], (unsigned long long)r->ends[kEndCommit], (unsigned long long)r->gpu_samples, r->vertex_ns / 1e6, r->fragment_ns / 1e6);
++            out += line;
++            r->passes = r->draws = r->short_passes = r->attach_bytes = r->gpu_samples = r->vertex_ns = r->fragment_ns = 0;
++            for (uint64_t& e : r->ends) e = 0;
++        }
++        return out;
++    }
++
++private:
++    struct Row {
++        PassKey key;
++        const char* kind = "";
++        uint64_t passes = 0, draws = 0, short_passes = 0, attach_bytes = 0, gpu_samples = 0, vertex_ns = 0, fragment_ns = 0;
++        uint64_t ends[kPassEnds] = {};
++    };
++    std::mutex lock_;
++    uint32_t used_ = kFirstFree;
++    Row rows_[kSlots];
++};
++
++inline PassTable& pass_table() {
++    static PassTable table;
++    return table;
++}
++}  // namespace botw_diag
 diff --git a/runtime/cemu_shims/botw_draw_cache.h b/runtime/cemu_shims/botw_draw_cache.h
 new file mode 100644
 index 0000000..419c01a
@@ -2319,10 +2824,10 @@ index 0000000..9813bab
 +#endif
 diff --git a/runtime/cemu_shims/botw_tune.h b/runtime/cemu_shims/botw_tune.h
 new file mode 100644
-index 0000000..2d392ed
+index 0000000..bb4596c
 --- /dev/null
 +++ b/runtime/cemu_shims/botw_tune.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,92 @@
 +// The experiment settings of the split host: <Documents>/botw_tune.txt, one "key=value" a line, "#" starts a comment.
 +// Read once at the start, so that an experiment needs a restart and no new install. A missing file, or a key left out,
 +// keeps the default, which is always what the host did before the setting existed.
@@ -2387,12 +2892,24 @@ index 0000000..2d392ed
 +}
 +
 +// Every key the host reads. Anything else in the file is reported in meta.txt: a typing mistake must not pass for a test.
-+constexpr const char* kKnownKeys[] = {"perf", "spike_ms", "diag_stall_ms", "diag_stall_stacks", "diag_locks", "diag_gpu", "ax_qos", "worker_qos", "fence_yield", "compile_qos", "audio_low_water_ms", "wake_after_unlock", "draw_memo", "support_dedupe"};
++constexpr const char* kKnownKeys[] = {"perf", "spike_ms", "diag_stall_ms", "diag_stall_stacks", "diag_locks", "diag_gpu", "diag_yields", "diag_passes", "diag_pass_gpu", "ax_qos", "worker_qos", "fence_yield", "compile_qos", "audio_low_water_ms", "wake_after_unlock", "draw_memo", "support_dedupe", "metal_cache_shared", "metal_commit_threshold"};
 +
 +inline bool known(const std::string& key) {
 +    for (const char* k : kKnownKeys)
 +        if (key == k) return true;
 +    return false;
++}
++
++// The keys that change what the game does, as opposed to what is measured. One at a time, or a result proves nothing.
++constexpr const char* kCorrectionKeys[] = {"ax_qos", "worker_qos", "fence_yield", "compile_qos", "audio_low_water_ms", "wake_after_unlock", "draw_memo", "support_dedupe", "metal_cache_shared", "metal_commit_threshold"};
++
++inline int corrections_active(const Parsed& p) {
++    int active = 0;
++    for (const char* key : kCorrectionKeys) {
++        const auto it = p.values.find(key);
++        if (it != p.values.end() && it->second != "0" && !it->second.empty()) active++;
++    }
++    return active;
 +}
 +
 +// An on/off experiment: off unless the file says 1.
@@ -3063,10 +3580,10 @@ index ebb7299..3e216a9 100644
  			return -1;
  		if (queued > kHighWaterFrames)
 diff --git a/runtime/src/thread.cpp b/runtime/src/thread.cpp
-index 03899a6..39591bf 100644
+index 03899a6..401d1fc 100644
 --- a/runtime/src/thread.cpp
 +++ b/runtime/src/thread.cpp
-@@ -8,9 +8,16 @@
+@@ -8,9 +8,17 @@
  #include <time.h>
  #include <unistd.h>
  
@@ -3077,13 +3594,14 @@ index 03899a6..39591bf 100644
  
 +#include "../cemu_shims/botw_perf.h"
 +#include "../cemu_shims/botw_tune.h"
++#include "../cemu_shims/botw_diag_tables.h"
 +#ifdef BOTW_SPLIT_HOST
 +extern std::atomic<pthread_t> g_gpu_thread;   // cemu_shims/overlay_menu.cpp
 +#endif
  #include "hle.h"
  #include "loader.h"
  
-@@ -33,7 +40,12 @@ void run_thread(GuestThread* t) {
+@@ -33,7 +41,12 @@ void run_thread(GuestThread* t) {
      // The game's main thread and the light timing threads (audio, alarms, GX2 callbacks) get the highest QoS so
      // the scheduler keeps them on performance cores (a phone has two); worker threads one step below.
      const bool critical = t->is_main || t->name == "AX" || t->name == "alarms" || t->name == "GX2 callbacks";
@@ -3097,7 +3615,7 @@ index 03899a6..39591bf 100644
      pthread_setname_np(t->name.empty() ? "guest" : t->name.c_str());
      PPCContext* c = &t->ctx;
      c->lr = 0;
-@@ -160,6 +172,41 @@ void dump(bool stacks) {
+@@ -160,6 +173,41 @@ void dump(bool stacks) {
      }
  }
  
@@ -3139,7 +3657,7 @@ index 03899a6..39591bf 100644
  void init_context(PPCContext* c, uint32_t stack_top, int core) {
      memset(c, 0, sizeof *c);
      c->r[1] = (stack_top - 0x20) & ~0xFu;
-@@ -198,6 +245,9 @@ GuestThread* adopt_host_thread(const char* name, uint32_t stack_size, int core)
+@@ -198,6 +246,9 @@ GuestThread* adopt_host_thread(const char* name, uint32_t stack_size, int core)
      t->core = core;
      t->started = true;
      t->suspend = 0;
@@ -3149,14 +3667,82 @@ index 03899a6..39591bf 100644
      std::lock_guard<std::mutex> l(g_klock);
      t->os = new_os_thread(name, 0, stack + stack_size, stack_size, 0, core);
      init_context(&t->ctx, stack + stack_size, core);
-@@ -358,18 +408,29 @@ HLE_EXPORT(coreinit, OSSetThreadSpecific) {
+@@ -357,20 +408,108 @@ HLE_EXPORT(coreinit, OSSetThreadSpecific) {
+ }
  
  HLE_EXPORT(coreinit, OSGetCoreId) { RET(current() ? current()->core : 1); }
++
++#ifdef BOTW_SPLIT_HOST
++// diag_yields: the same scheduler call, counted by thread, kind and guest return address. One call in 64 is timed, on
++// the wall clock and on the thread's CPU clock: the difference is the time other threads ran.
++namespace {
++std::mutex g_yield_tables_lock;
++std::vector<botw_diag::YieldTable*> g_yield_tables;
++thread_local botw_diag::YieldTable* t_yield_table = nullptr;
++thread_local uint64_t t_yield_timed_end = 0;
++thread_local uint32_t t_yield_timed_lr = 0;
++thread_local uint8_t t_yield_timed_kind = 0;
++
++uint64_t thread_cpu_ns() {
++    struct timespec ts;
++    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++}
++
++// The return address its caller saved, by the guest's stack back chain. Only a hint for the report: never dereferenced by the host otherwise.
++uint32_t guest_caller(const PPCContext* c) {
++    const uint32_t sp = c->r[1];
++    if (sp < 0x1000 || sp >= 0xFFFFF000u) return 0;
++    const uint32_t previous = mem::r32(sp);
++    if (previous < 0x1000 || previous >= 0xFFFFF000u) return 0;
++    return mem::r32(previous + 4);
++}
++
++template <typename Call>
++void measured_scheduler_call(PPCContext* c, uint8_t kind, Call call) {
++    if (!t_yield_table) {
++        t_yield_table = new botw_diag::YieldTable(threads::current() ? threads::current()->name : std::string("host"));
++        std::lock_guard<std::mutex> l(g_yield_tables_lock);
++        g_yield_tables.push_back(t_yield_table);
++    }
++    const uint32_t lr = c->lr;
++    if (t_yield_timed_end) {
++        t_yield_table->note_gap(t_yield_timed_lr, t_yield_timed_kind, botw_perf::now_ns() - t_yield_timed_end);
++        t_yield_timed_end = 0;
++    }
++    if (!t_yield_table->note(lr, kind)) {
++        call();
++        return;
++    }
++    const uint64_t cpu_begin = thread_cpu_ns();
++    const uint64_t begin = botw_perf::now_ns();
++    call();
++    const uint64_t end = botw_perf::now_ns();
++    t_yield_table->note_sample(lr, kind, guest_caller(c), end - begin, thread_cpu_ns() - cpu_begin);
++    t_yield_timed_lr = lr;
++    t_yield_timed_kind = kind;
++    t_yield_timed_end = botw_perf::now_ns();
++}
++}  // namespace
++
++std::string botw_yield_report(double t_s) {
++    std::vector<botw_diag::YieldTable*> tables;
++    {
++        std::lock_guard<std::mutex> l(g_yield_tables_lock);
++        tables = g_yield_tables;
++    }
++    return botw_diag::yield_report(t_s, tables);
++}
++#endif
  HLE_EXPORT(coreinit, OSGetStackPointer) { RET(c->r[1]); }
 -HLE_EXPORT(coreinit, OSYieldThread) { sched_yield(); }
 +HLE_EXPORT(coreinit, OSYieldThread) {
 +#ifdef BOTW_SPLIT_HOST
 +    if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) threads::note_yield();
++    if (botw_diag::g_yields_on.load(std::memory_order_relaxed)) {
++        measured_scheduler_call(c, botw_diag::kYieldThread, [] { sched_yield(); });
++        return;
++    }
 +#endif
 +    sched_yield();
 +}
@@ -3168,6 +3754,10 @@ index 03899a6..39591bf 100644
      if (ticks <= 0) {
 +#ifdef BOTW_SPLIT_HOST
 +        if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) threads::note_yield();
++        if (botw_diag::g_yields_on.load(std::memory_order_relaxed)) {
++            measured_scheduler_call(c, botw_diag::kSleepZero, [] { sched_yield(); });
++            return;
++        }
 +#endif
          sched_yield();
          return;
@@ -3178,8 +3768,15 @@ index 03899a6..39591bf 100644
 +    if (botw_perf::g_locks_on.load(std::memory_order_relaxed)) threads::note_sleep();
 +#endif
      threads::WaitMark w("sleep", (uint32_t)(ns / 1000));
++#ifdef BOTW_SPLIT_HOST
++    if (botw_diag::g_yields_on.load(std::memory_order_relaxed)) {
++        measured_scheduler_call(c, botw_diag::kSleepTicks, [&] { nanosleep(&ts, nullptr); });
++        return;
++    }
++#endif
      nanosleep(&ts, nullptr);
  }
+ 
 diff --git a/runtime/src/thread.h b/runtime/src/thread.h
 index 8666075..993ea8e 100644
 --- a/runtime/src/thread.h
