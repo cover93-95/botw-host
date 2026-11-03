@@ -735,7 +735,7 @@ new file mode 100644
 index 0000000..8eda9dd
 --- /dev/null
 +++ b/runtime/src/game/native_duo.cpp
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,121 @@
 +#include "native_duo.h"
 +
 +#include <CommonCrypto/CommonDigest.h>
