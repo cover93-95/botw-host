@@ -828,64 +828,230 @@ index dee5dcb..42f7165 100644
      cargv.push_back(nullptr);
 diff --git a/ios/src/perf_ios.mm b/ios/src/perf_ios.mm
 new file mode 100644
-index 0000000..b88022b
+index 0000000..8353274
 --- /dev/null
 +++ b/ios/src/perf_ios.mm
-@@ -0,0 +1,56 @@
-+// Writes the measurements of cemu_shims/botw_perf.h to <Documents>/botw_perf.csv every 5 s, from a low-priority thread.
-+// On by default in this build; a file <Documents>/botw_perf_off turns it off. The previous run's file is kept.
+@@ -0,0 +1,222 @@
++// Writes the measurements of cemu_shims/botw_perf.h every 5 s from a low-priority thread, one folder per run, in
++// <Documents>/perf/<date-time>/: frames.csv, spikes.csv (each long frame and what held it up), threads.csv (CPU time by
++// thread name) and meta.txt. perf/perf_report.py reads them. <Documents>/botw_tune.txt chooses the level: perf=full,
++// frames or off. A file <Documents>/botw_perf_off still turns it off, as in v5.
 +#ifdef BOTW_SPLIT_HOST
 +#import <Foundation/Foundation.h>
++#import <UIKit/UIKit.h>
 +#include <mach/mach.h>
++#include <mach/thread_info.h>
 +#include <os/proc.h>
 +#include <pthread.h>
++#include <sys/sysctl.h>
++#include <time.h>
 +#include <unistd.h>
 +
++#include <atomic>
 +#include <cstdio>
++#include <map>
++#include <mutex>
 +#include <string>
 +#include <thread>
 +
 +#include "../../runtime/cemu_shims/botw_perf.h"
++#include "../../runtime/cemu_shims/botw_tune.h"
 +#include "split_ios.h"
++
++extern float g_render_scale;
 +
 +namespace {
 +constexpr int kWindowSeconds = 5;
++constexpr int kRunsKept = 20;
 +
-+void write_loop(FILE* out) {
++std::mutex g_meta_lock;
++FILE* g_meta = nullptr;
++std::atomic<uint64_t> g_memory_warnings{0};
++
++void meta_line(const std::string& line) {
++    std::lock_guard<std::mutex> l(g_meta_lock);
++    if (!g_meta) return;
++    fprintf(g_meta, "%s\n", line.c_str());
++    fflush(g_meta);
++}
++
++std::string clock_text(const char* format) {
++    const time_t now = time(nullptr);
++    struct tm parts = {};
++    localtime_r(&now, &parts);
++    char text[32];
++    strftime(text, sizeof text, format, &parts);
++    return text;
++}
++
++std::string sysctl_text(const char* name) {
++    char value[128] = {};
++    size_t size = sizeof value - 1;
++    return sysctlbyname(name, value, &size, nullptr, 0) == 0 ? value : "?";
++}
++
++// What one Scoped costs here, on this low-priority thread, so a little more than on the threads it measures.
++double scope_cost_ns() {
++    constexpr int kRounds = 200000;
++    botw_perf::g_enabled.store(true, std::memory_order_relaxed);
++    botw_perf::Counter counter;
++    const uint64_t begin = botw_perf::now_ns();
++    for (int i = 0; i < kRounds; i++) botw_perf::Scoped scope(counter);
++    return (double)(botw_perf::now_ns() - begin) / kRounds;
++}
++
++struct ThreadTime {
++    uint64_t cpu_ns;
++    int priority;
++    int threads;
++};
++
++// CPU time by thread name since the last call, for threads.csv. Threads sharing a name are added together.
++void write_threads(FILE* out, double t_s, std::map<uint64_t, uint64_t>& seen_ns) {
++    thread_act_array_t list = nullptr;
++    mach_msg_type_number_t count = 0;
++    if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS) return;
++    std::map<std::string, ThreadTime> names;
++    std::map<uint64_t, uint64_t> now_ns;
++    for (mach_msg_type_number_t i = 0; i < count; i++) {
++        thread_extended_info_data_t info = {};
++        mach_msg_type_number_t info_count = THREAD_EXTENDED_INFO_COUNT;
++        thread_identifier_info_data_t id = {};
++        mach_msg_type_number_t id_count = THREAD_IDENTIFIER_INFO_COUNT;
++        if (thread_info(list[i], THREAD_EXTENDED_INFO, (thread_info_t)&info, &info_count) == KERN_SUCCESS &&
++            thread_info(list[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&id, &id_count) == KERN_SUCCESS) {
++            const uint64_t cpu = info.pth_user_time + info.pth_system_time;
++            now_ns[id.thread_id] = cpu;
++            const auto before = seen_ns.find(id.thread_id);
++            ThreadTime& slot = names[info.pth_name[0] ? std::string(info.pth_name) : std::string("unnamed")];
++            slot.cpu_ns += cpu - (before == seen_ns.end() ? 0 : before->second);
++            slot.priority = info.pth_curpri;
++            slot.threads++;
++        }
++        mach_port_deallocate(mach_task_self(), list[i]);
++    }
++    vm_deallocate(mach_task_self(), (vm_address_t)list, count * sizeof(thread_act_t));
++    seen_ns.swap(now_ns);
++    for (const auto& entry : names)
++        if (entry.second.cpu_ns >= 1000000) fprintf(out, "%.0f,%s,%d,%d,%.1f\n", t_s, entry.first.c_str(), entry.second.threads, entry.second.priority, entry.second.cpu_ns / 1e6);
++    fflush(out);
++}
++
++struct Files {
++    FILE* frames;
++    FILE* spikes;
++    FILE* threads;
++};
++
++void write_loop(Files files, bool full) {
 +    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 +    pthread_setname_np("botw_perf");
-+    fprintf(out, "%s,footprint_mb,available_mb,thermal\n", botw_perf::kHeader);
-+    fflush(out);
++    meta_line("scope_cost_ns=" + std::to_string(scope_cost_ns()));
++    botw_perf::g_enabled.store(full, std::memory_order_relaxed);
++    botw_perf::g_frames_on.store(true, std::memory_order_relaxed);
++    fprintf(files.frames, "%s,footprint_mb,available_mb,compressed_mb,faults,pageins,csw,mem_warnings,thermal,low_power,clock,hist,phist\n", botw_perf::kHeader);
++    fprintf(files.spikes, "%s\n", botw_perf::kSpikeHeader);
++    fprintf(files.threads, "t_s,name,threads,priority,cpu_ms\n");
++    fflush(files.frames);
++    fflush(files.spikes);
++    fflush(files.threads);
 +    const uint64_t begin = botw_perf::now_ns();
 +    uint64_t last = begin;
++    std::map<uint64_t, uint64_t> thread_ns;
++    task_events_info_data_t events_before = {};
++    bool scale_noted = false;
 +    for (;;) {
 +        sleep(kWindowSeconds);
 +        const uint64_t now = botw_perf::now_ns();
-+        char line[1024];
-+        const int n = botw_perf::write_window(line, sizeof line, (now - begin) / 1e9, (now - last) / 1e9);
++        const double t_s = (now - begin) / 1e9;
++        static char line[2048], hist[1024], present_hist[1024];
++        const int n = botw_perf::write_window(line, sizeof line, t_s, (now - last) / 1e9, hist, sizeof hist, present_hist, sizeof present_hist);
 +        last = now;
 +        task_vm_info_data_t vm = {};
 +        mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
 +        const bool ok = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS;
-+        fprintf(out, "%.*s,%llu,%llu,%d\n", n, line, ok ? (unsigned long long)(vm.phys_footprint >> 20) : 0, (unsigned long long)(os_proc_available_memory() >> 20),
-+                (int)NSProcessInfo.processInfo.thermalState);
-+        fflush(out);
++        task_events_info_data_t events = {};
++        count = TASK_EVENTS_INFO_COUNT;
++        const bool events_ok = task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&events, &count) == KERN_SUCCESS;
++        NSProcessInfo* process = NSProcessInfo.processInfo;
++        fprintf(files.frames, "%.*s,%llu,%llu,%llu,%d,%d,%d,%llu,%d,%d,%s,%s,%s\n", n, line, ok ? (unsigned long long)(vm.phys_footprint >> 20) : 0, (unsigned long long)(os_proc_available_memory() >> 20),
++                ok ? (unsigned long long)(vm.compressed >> 20) : 0, events_ok ? events.faults - events_before.faults : 0, events_ok ? events.pageins - events_before.pageins : 0, events_ok ? events.csw - events_before.csw : 0,
++                (unsigned long long)g_memory_warnings.exchange(0, std::memory_order_relaxed), (int)process.thermalState, process.lowPowerModeEnabled ? 1 : 0, clock_text("%H:%M:%S").c_str(), hist, present_hist);
++        fflush(files.frames);
++        if (events_ok) events_before = events;
++        botw_perf::Spike spike;
++        while (botw_perf::next_spike(spike)) {
++            botw_perf::write_spike(line, sizeof line, spike, begin);
++            fprintf(files.spikes, "%s\n", line);
++        }
++        fflush(files.spikes);
++        write_threads(files.threads, t_s, thread_ns);
++        if (!scale_noted && g_render_scale > 0) {
++            scale_noted = true;
++            meta_line("render_scale=" + std::to_string(g_render_scale));
++        }
 +    }
++}
++
++std::string read_text(const std::string& path) {
++    std::string text;
++    if (FILE* f = fopen(path.c_str(), "r")) {
++        char chunk[1024];
++        size_t got;
++        while ((got = fread(chunk, 1, sizeof chunk, f)) > 0) text.append(chunk, got);
++        fclose(f);
++    }
++    return text;
++}
++
++// The older runs' folders, oldest first by their names, which are dates. Nothing else in Documents is ever touched.
++void remove_old_runs(NSString* runs) {
++    NSFileManager* files = NSFileManager.defaultManager;
++    NSArray<NSString*>* names = [[files contentsOfDirectoryAtPath:runs error:nil] sortedArrayUsingSelector:@selector(compare:)];
++    NSMutableArray<NSString*>* dated = [NSMutableArray array];
++    NSPredicate* format = [NSPredicate predicateWithFormat:@"SELF MATCHES %@", @"[0-9]{8}-[0-9]{6}"];
++    for (NSString* name in names)
++        if ([format evaluateWithObject:name]) [dated addObject:name];
++    for (NSInteger i = 0; i + kRunsKept < (NSInteger)dated.count; i++) [files removeItemAtPath:[runs stringByAppendingPathComponent:dated[i]] error:nil];
 +}
 +}  // namespace
 +
++void botw_perf_note(const char* line) { meta_line(line); }
++
 +void botw_perf_start(const char* docs) {
 +    const std::string folder = docs;
-+    if (FILE* off = fopen((folder + "/botw_perf_off").c_str(), "r")) {
-+        fclose(off);
-+        return;
-+    }
-+    const std::string path = folder + "/botw_perf.csv";
-+    rename(path.c_str(), (folder + "/botw_perf_prev.csv").c_str());
-+    FILE* out = fopen(path.c_str(), "w");
-+    if (!out) return;
-+    botw_perf::g_enabled.store(true, std::memory_order_relaxed);
-+    std::thread(write_loop, out).detach();
++    const botw_tune::Parsed tune = botw_tune::parse(read_text(folder + "/botw_tune.txt"));
++    const std::string level = botw_tune::text(tune, "perf", "full");
++    if (level == "off" || access((folder + "/botw_perf_off").c_str(), F_OK) == 0) return;
++
++    NSString* runs = [@(docs) stringByAppendingPathComponent:@"perf"];
++    NSString* run = [runs stringByAppendingPathComponent:@(clock_text("%Y%m%d-%H%M%S").c_str())];
++    if (![NSFileManager.defaultManager createDirectoryAtPath:run withIntermediateDirectories:YES attributes:nil error:nil]) return;
++    remove_old_runs(runs);
++    const std::string path = run.UTF8String;
++    Files files = {fopen((path + "/frames.csv").c_str(), "w"), fopen((path + "/spikes.csv").c_str(), "w"), fopen((path + "/threads.csv").c_str(), "w")};
++    g_meta = fopen((path + "/meta.txt").c_str(), "w");
++    if (!files.frames || !files.spikes || !files.threads || !g_meta) return;
++
++    const bool full = level != "frames";
++    meta_line(std::string("version=") + botw_perf::kVersion);
++    meta_line("level=" + std::string(full ? "full" : "frames"));
++    meta_line("started=" + clock_text("%Y-%m-%d %H:%M:%S"));
++    meta_line("model=" + sysctl_text("hw.machine"));
++    meta_line("os=" + std::string(UIDevice.currentDevice.systemVersion.UTF8String));
++    meta_line("cores=" + std::to_string(NSProcessInfo.processInfo.activeProcessorCount));
++    meta_line("screen_max_fps=" + std::to_string((long)UIScreen.mainScreen.maximumFramesPerSecond));
++    for (const auto& entry : tune.values) meta_line("tune." + entry.first + "=" + entry.second);
++    for (const std::string& bad : tune.bad_lines) meta_line("tune_unreadable=" + bad);
++
++    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil usingBlock:^(NSNotification*) {
++        g_memory_warnings.fetch_add(1, std::memory_order_relaxed);
++    }];
++    botw_perf::g_spike_ns.store((uint64_t)botw_tune::integer(tune, "spike_ms", 25, 17, 1000) * 1000000, std::memory_order_relaxed);
++    // The audio device opens during the start and registers its request callback only if this is already true; the
++    // writer thread sets the final level after its calibration, which needs it on too.
++    botw_perf::g_enabled.store(full, std::memory_order_relaxed);
++    std::thread(write_loop, files, full).detach();
 +}
 +#endif
 diff --git a/ios/src/split_ios.h b/ios/src/split_ios.h
@@ -927,6 +1093,48 @@ index 0000000..0ee44b8
 +std::string botw_mem_line();
 +// Writes <docs>/botw_diag.txt line by line, so a kill leaves the last step reached. Returns a short summary.
 +std::string botw_diag_run(const char* docs, GuestLoad guest);
+diff --git a/runtime/cemu/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp b/runtime/cemu/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
+index 44e3a76..c3ac833 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
++++ b/runtime/cemu/Cafe/HW/Latte/Core/LatteCommandProcessor.cpp
+@@ -10,6 +10,7 @@
+ #include "Cafe/HW/Latte/Core/LatteBufferCache.h"
+ #include "Cafe/HW/Latte/Core/LattePM4.h"
+ #include "Cafe/HW/Latte/Core/LatteSurfaceCopy.h"
++#include "botw_perf.h"
+ 
+ #include "Cafe/OS/libs/coreinit/coreinit_Time.h"
+ #include "Cafe/OS/libs/TCL/TCL.h" // TCL currently handles the GPU command ringbuffer
+@@ -175,6 +176,7 @@ uint32 LatteCP_readU32Deprc()
+ 			return cmdWord;
+ 
+ 		g_renderer->NotifyLatteCommandProcessorIdle(); // let the renderer know in case it wants to flush any commands
++		BOTW_PERF_SCOPE(g_fifo_wait);
+ 		performanceMonitor.gpuTime_idleTime.beginMeasuring();
+ 		// no command data available, spin in a busy loop for a bit then check again
+ 		for (sint32 busy = 0; busy < 80; busy++)
+diff --git a/runtime/cemu/Cafe/HW/Latte/Core/LatteThread.cpp b/runtime/cemu/Cafe/HW/Latte/Core/LatteThread.cpp
+index ceedc92..ebb271b 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Core/LatteThread.cpp
++++ b/runtime/cemu/Cafe/HW/Latte/Core/LatteThread.cpp
+@@ -7,6 +7,7 @@
+ #include "Cafe/GameProfile/GameProfile.h"
+ #include "Cafe/GraphicPack/GraphicPack2.h"
+ #include "WindowSystem.h"
++#include "botw_perf.h"
+ 
+ #include "Cafe/HW/Latte/Core/LatteBufferCache.h"
+ 
+@@ -197,6 +198,9 @@ int Latte_ThreadEntry()
+ 	}
+ 	// load disk shader cache
+     LatteShaderCache_Load();
++#ifdef BOTW_SPLIT_HOST
++    botw_perf::t_render_thread = true;   // Only now: loading the disk cache is no stall of the game.
++#endif
+ 	// init registers
+ 	Latte_LoadInitialRegisters();
+ 	// let CPU thread know the GPU is done initializing
 diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.cpp
 index 53ac354..dba46ce 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/LatteTextureReadbackMtl.cpp
@@ -947,8 +1155,81 @@ index 53ac354..dba46ce 100644
      m_commandBuffer->waitUntilCompleted();
  }
  
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalLayerHandle.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalLayerHandle.cpp
+index ddc9417..05d2759 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalLayerHandle.cpp
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalLayerHandle.cpp
+@@ -2,6 +2,15 @@
+ #include "Cafe/HW/Latte/Renderer/Metal/MetalLayer.h"
+ 
+ #include "gui/interface/WindowSystem.h"
++#include "botw_perf.h"
++
++#ifdef BOTW_SPLIT_HOST
++static void botw_perf_note_size(float w, float h)
++{
++    botw_perf::g_drawable_w.store((uint64_t)w, std::memory_order_relaxed);
++    botw_perf::g_drawable_h.store((uint64_t)h, std::memory_order_relaxed);
++}
++#endif
+ 
+ MetalLayerHandle::MetalLayerHandle(MTL::Device* device, const Vector2i& size, bool mainWindow)
+ {
+@@ -11,6 +20,9 @@ MetalLayerHandle::MetalLayerHandle(MTL::Device* device, const Vector2i& size, bo
+     m_layer->setDevice(device);
+     m_layer->setDrawableSize(CGSize{(float)size.x * m_layerScaleX, (float)size.y * m_layerScaleY});
+     m_layer->setFramebufferOnly(true);
++#ifdef BOTW_SPLIT_HOST
++    botw_perf_note_size((float)size.x * m_layerScaleX, (float)size.y * m_layerScaleY);
++#endif
+ }
+ 
+ MetalLayerHandle::~MetalLayerHandle()
+@@ -22,6 +34,9 @@ MetalLayerHandle::~MetalLayerHandle()
+ void MetalLayerHandle::Resize(const Vector2i& size)
+ {
+     m_layer->setDrawableSize(CGSize{(float)size.x * m_layerScaleX, (float)size.y * m_layerScaleY});
++#ifdef BOTW_SPLIT_HOST
++    botw_perf_note_size((float)size.x * m_layerScaleX, (float)size.y * m_layerScaleY);
++#endif
+ }
+ 
+ bool MetalLayerHandle::AcquireDrawable()
+@@ -41,6 +56,10 @@ bool MetalLayerHandle::AcquireDrawable()
+ 
+ void MetalLayerHandle::PresentDrawable(MTL::CommandBuffer* commandBuffer)
+ {
++#ifdef BOTW_SPLIT_HOST
++    if (botw_perf::g_frames_on.load(std::memory_order_relaxed))
++        m_drawable->addPresentedHandler(MTL::DrawablePresentedHandlerFunction([](MTL::Drawable* drawable) { botw_perf::drawable_presented(drawable->presentedTime()); }));
++#endif
+     commandBuffer->presentDrawable(m_drawable);
+     m_drawable = nullptr;
+ }
+diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.cpp
+index a922365..defc9f7 100644
+--- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.cpp
++++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCache.cpp
+@@ -16,6 +16,7 @@
+ #include "config/ActiveSettings.h"
+ 
+ #include <openssl/sha.h>
++#include "botw_perf.h"
+ 
+ static bool g_compilePipelineThreadInit{false};
+ static std::mutex g_compilePipelineMutex;
+@@ -70,6 +71,9 @@ static void queuePipeline(MetalPipelineCompiler* v)
+ {
+ 	std::unique_lock lock(g_compilePipelineMutex);
+ 	g_compilePipelineRequests.push(std::move(v));
++#ifdef BOTW_SPLIT_HOST
++	botw_perf::raise_max(botw_perf::g_pipe_queue_max, g_compilePipelineRequests.size());
++#endif
+ 	lock.unlock();
+ 	g_compilePipelineCondVar.notify_one();
+ }
 diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp
-index 6193ab1..fc7c989 100644
+index 6193ab1..be576dc 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp
 +++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.cpp
 @@ -1,4 +1,5 @@
@@ -957,18 +1238,30 @@ index 6193ab1..fc7c989 100644
  #include "Cafe/HW/Latte/Renderer/Metal/MetalPipelineCompiler.h"
  #include "Cafe/HW/Latte/Renderer/Metal/MetalRenderer.h"
  #include "Cafe/HW/Latte/Renderer/Metal/CachedFBOMtl.h"
-@@ -314,6 +315,9 @@ void MetalPipelineCompiler::InitFromState(const LatteFetchShader* fetchShader, c
+@@ -343,6 +344,11 @@ bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool
+     NS::Error* error = nullptr;
  
- bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool showInOverlay)
- {
+     auto start = std::chrono::high_resolution_clock::now();
 +#ifdef BOTW_SPLIT_HOST
-+    botw_perf::Scoped botw_perf_compile(isRenderThread ? botw_perf::g_sync_pipeline : botw_perf::g_async_pipeline);
++    // Only the Metal call, by the thread it really runs on: the disk cache's loader also passes isRenderThread.
++    {
++    botw_perf::Scoped botw_perf_compile(botw_perf::t_render_thread ? botw_perf::g_sync_pipeline : botw_perf::g_async_pipeline);
 +#endif
-     if (m_usesGeometryShader && !m_mtlr->SupportsMeshShaders())
-         return false;
+     if (m_usesGeometryShader)
+     {
+         auto desc = static_cast<MTL::MeshRenderPipelineDescriptor*>(m_pipelineDescriptor);
+@@ -372,6 +378,9 @@ bool MetalPipelineCompiler::Compile(bool forceCompile, bool isRenderThread, bool
+ #endif
+        	pipeline = m_mtlr->GetDevice()->newRenderPipelineState(desc, MTL::PipelineOptionNone, nullptr, &error);
+     }
++#ifdef BOTW_SPLIT_HOST
++    }
++#endif
+     auto end = std::chrono::high_resolution_clock::now();
  
+     auto creationDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
-index 51c61bc..6524dd3 100644
+index 51c61bc..ddb3540 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
 +++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/MetalRenderer.cpp
 @@ -26,6 +26,7 @@
@@ -998,7 +1291,20 @@ index 51c61bc..6524dd3 100644
  }
  
  void MetalRenderer::NotifyLatteCommandProcessorIdle()
-@@ -1631,7 +1636,10 @@ void MetalRenderer::occlusionQuery_destroy(LatteQueryObject* queryObj) {
+@@ -1228,7 +1233,12 @@ void MetalRenderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32
+     // Render pipeline state
+     PipelineObject* pipelineObj = m_pipelineCache->GetRenderPipelineState(fetchShader, vertexShader, geometryShader, pixelShader, m_state.m_lastUsedFBO.m_attachmentsInfo, m_state.m_activeFBO.m_attachmentsInfo, m_state.m_activeFBO.m_fbo->m_size, count, LatteGPUState.contextNew);
+     if (!pipelineObj->m_pipeline)
++    {
++#ifdef BOTW_SPLIT_HOST
++        botw_perf::g_draws_skipped.fetch_add(1, std::memory_order_relaxed);
++#endif
+         return;
++    }
+ 
+     if (pipelineObj->m_pipeline != encoderState.m_renderPipelineState)
+    	{
+@@ -1631,7 +1641,10 @@ void MetalRenderer::occlusionQuery_destroy(LatteQueryObject* queryObj) {
  
  void MetalRenderer::occlusionQuery_flush() {
      if (m_occlusionQuery.m_lastCommandBuffer)
@@ -1009,21 +1315,18 @@ index 51c61bc..6524dd3 100644
  }
  
  void MetalRenderer::occlusionQuery_updateState() {
-@@ -1965,6 +1973,13 @@ void MetalRenderer::ProcessFinishedCommandBuffers()
+@@ -1965,6 +1978,10 @@ void MetalRenderer::ProcessFinishedCommandBuffers()
          auto commandBuffer = *it;
          if (CommandBufferCompleted(commandBuffer))
          {
 +#ifdef BOTW_SPLIT_HOST
 +            if (botw_perf::g_enabled.load(std::memory_order_relaxed))
-+            {
-+                botw_perf::g_gpu_ns.fetch_add((uint64_t)((commandBuffer->GPUEndTime() - commandBuffer->GPUStartTime()) * 1e9), std::memory_order_relaxed);
-+                botw_perf::g_command_buffers.fetch_add(1, std::memory_order_relaxed);
-+            }
++                botw_perf::gpu_interval(commandBuffer->GPUStartTime(), commandBuffer->GPUEndTime());
 +#endif
              m_memoryManager->CleanupBuffers(commandBuffer);
              commandBuffer->release();
              it = m_executingCommandBuffers.erase(it);
-@@ -1989,6 +2004,7 @@ bool MetalRenderer::AcquireDrawable(bool mainWindow)
+@@ -1989,6 +2006,7 @@ bool MetalRenderer::AcquireDrawable(bool mainWindow)
          m_state.m_usesSRGB = latteBufferUsesSRGB;
      }
  
@@ -1032,7 +1335,7 @@ index 51c61bc..6524dd3 100644
  }
  
 diff --git a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp
-index f00af85..9aa7f43 100644
+index f00af85..db2afd9 100644
 --- a/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp
 +++ b/runtime/cemu/Cafe/HW/Latte/Renderer/Metal/RendererShaderMtl.cpp
 @@ -8,6 +8,7 @@
@@ -1048,20 +1351,38 @@ index f00af85..9aa7f43 100644
  void RendererShaderMtl::PreponeCompilation(bool isRenderThread)
  {
 +#ifdef BOTW_SPLIT_HOST
-+    botw_perf::Scoped botw_perf_shader(isRenderThread ? botw_perf::g_sync_shader : botw_perf::g_async_pipeline);
++    botw_perf::Scoped botw_perf_shader(botw_perf::g_sync_shader, botw_perf::t_render_thread);
 +#endif
  	shaderMtlThreadPool.s_compilationQueueMutex.lock();
  	bool isStillQueued = m_compilationState.hasState(COMPILATION_STATE::QUEUED);
  	if (isStillQueued)
+@@ -264,6 +268,9 @@ bool RendererShaderMtl::IsCompiled()
+ 
+ bool RendererShaderMtl::WaitForCompiled()
+ {
++#ifdef BOTW_SPLIT_HOST
++	botw_perf::Scoped botw_perf_shader(botw_perf::g_sync_shader, botw_perf::t_render_thread && !IsCompiled());
++#endif
+ 	m_compilationState.waitUntilValue(COMPILATION_STATE::DONE);
+ 	return true;
+ }
+@@ -316,6 +323,7 @@ MTL::Library* RendererShaderMtl::LibraryFromAIR(std::span<uint8> data)
+ 
+ void RendererShaderMtl::CompileInternal()
+ {
++    BOTW_PERF_SCOPE(g_shader_compile);
+     MTL::Library* library = nullptr;
+ 
+     // First, try to retrieve the compiled shader from the AIR cache
 diff --git a/runtime/cemu_shims/botw_perf.h b/runtime/cemu_shims/botw_perf.h
 new file mode 100644
-index 0000000..cbd72f7
+index 0000000..7e53280
 --- /dev/null
 +++ b/runtime/cemu_shims/botw_perf.h
-@@ -0,0 +1,139 @@
-+// Light measurements for the split host (BOTW_SPLIT_HOST): only relaxed atomics on the hot paths, and nothing that
-+// changes what the game does. A low-priority thread writes them out (ios/src/perf_ios.mm). Without BOTW_SPLIT_HOST
-+// every macro is empty.
+@@ -0,0 +1,291 @@
++// Light measurements for the split host (BOTW_SPLIT_HOST): relaxed atomics on the hot paths, and nothing that changes
++// what the game does. A low-priority thread writes them out (ios/src/perf_ios.mm). Without BOTW_SPLIT_HOST every macro
++// is empty. perf/perf_report.py reads what comes out; a column added here belongs there too.
 +#pragma once
 +#ifdef BOTW_SPLIT_HOST
 +#include <atomic>
@@ -1070,11 +1391,15 @@ index 0000000..cbd72f7
 +#include <cstdio>
 +
 +namespace botw_perf {
++constexpr const char* kVersion = "v6";
++
 +inline uint64_t now_ns() {
 +    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 +}
 +
-+inline std::atomic<bool> g_enabled{false};
++// frames: the frame and present times alone. enabled: everything. Comparing the two on one scene is the real cost.
++inline std::atomic<bool> g_frames_on{false}, g_enabled{false};
++inline std::atomic<bool> g_paused{false};   // In the background: frames stop, and the gap they leave is no stall.
 +
 +inline void raise_max(std::atomic<uint64_t>& slot, uint64_t value) {
 +    uint64_t seen = slot.load(std::memory_order_relaxed);
@@ -1082,58 +1407,167 @@ index 0000000..cbd72f7
 +    }
 +}
 +
++inline uint64_t take(std::atomic<uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); }
++
++// What held up the render thread during one frame. Only that thread touches these, set apart by t_render_thread.
++enum Stage { kStageSyncPipe, kStageSyncShader, kStageIdle, kStageOcclusion, kStageReadback, kStageDrawable, kStageFifo, kStages, kNoStage = -1 };
++inline thread_local bool t_render_thread = false;
++inline uint64_t g_stage_ns[kStages];
++
 +struct Counter {
 +    std::atomic<uint64_t> count{0}, total_ns{0}, max_ns{0};
++    int stage = kNoStage;
 +    void add(uint64_t ns) {
 +        count.fetch_add(1, std::memory_order_relaxed);
 +        total_ns.fetch_add(ns, std::memory_order_relaxed);
 +        raise_max(max_ns, ns);
++        if (stage != kNoStage && t_render_thread) g_stage_ns[stage] += ns;
 +    }
 +};
 +
-+inline Counter g_sync_pipeline, g_async_pipeline, g_sync_shader;   // Compilation
-+inline Counter g_wait_idle, g_wait_occlusion, g_wait_readback, g_wait_drawable;   // The CPU waiting for the GPU
-+inline std::atomic<uint64_t> g_gpu_ns{0}, g_command_buffers{0};
++inline Counter g_sync_pipeline{.stage = kStageSyncPipe}, g_async_pipeline, g_sync_shader{.stage = kStageSyncShader}, g_shader_compile;   // Compilation
++inline Counter g_wait_idle{.stage = kStageIdle}, g_wait_occlusion{.stage = kStageOcclusion}, g_wait_readback{.stage = kStageReadback}, g_wait_drawable{.stage = kStageDrawable};   // The CPU waiting for the GPU
++inline Counter g_fifo_wait{.stage = kStageFifo}, g_swap_backlog, g_fs_read;   // The render thread with nothing to do; the game held back by it; the game's file reads
++inline std::atomic<uint64_t> g_gpu_busy_ns{0}, g_gpu_max_ns{0}, g_command_buffers{0}, g_draws_skipped{0}, g_pipe_queue_max{0};
++inline std::atomic<uint64_t> g_drawable_w{0}, g_drawable_h{0};
++inline double g_gpu_last_end = 0;   // Render thread only: its command buffers finish in order.
 +
-+// Frames, by upper bound in milliseconds. The last bucket takes everything above.
-+constexpr int kBounds[] = {12, 17, 20, 25, 33, 50, 75, 100, 150, 250};
-+constexpr int kBuckets = sizeof kBounds / sizeof kBounds[0] + 1;
-+inline std::atomic<uint64_t> g_frame_buckets[kBuckets];
-+inline std::atomic<uint64_t> g_frame_max_ns{0}, g_last_frame_ns{0};
-+
-+inline void add_frame(uint64_t ns) {
-+    const uint64_t ms = ns / 1000000;
-+    int i = 0;
-+    while (i < kBuckets - 1 && ms >= (uint64_t)kBounds[i]) i++;
-+    g_frame_buckets[i].fetch_add(1, std::memory_order_relaxed);
-+    raise_max(g_frame_max_ns, ns);
++// One command buffer's time on the GPU. Those of a frame can overlap, so only what lies past the previous one's end counts as busy.
++inline void gpu_interval(double start, double end) {
++    if (start <= 0 || end <= start) return;
++    g_command_buffers.fetch_add(1, std::memory_order_relaxed);
++    raise_max(g_gpu_max_ns, (uint64_t)((end - start) * 1e9));
++    const double from = start > g_gpu_last_end ? start : g_gpu_last_end;
++    if (end > from) g_gpu_busy_ns.fetch_add((uint64_t)((end - from) * 1e9), std::memory_order_relaxed);
++    if (end > g_gpu_last_end) g_gpu_last_end = end;
 +}
 +
++// Times by upper bound in milliseconds: every millisecond up to 40, where the percentiles matter, then coarser.
++constexpr int kBounds[] = {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
++                           29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 45, 50, 60, 75, 100, 150, 250, 500, 1000};
++constexpr int kBuckets = sizeof kBounds / sizeof kBounds[0] + 1;
++
++struct Histogram {
++    std::atomic<uint64_t> buckets[kBuckets] = {};
++    std::atomic<uint64_t> max_ns{0};
++    void add(uint64_t ns) {
++        const uint64_t ms = ns / 1000000;
++        int i = 0;
++        if (ms < 40) i = (int)ms;
++        else
++            while (i < kBuckets - 1 && ms >= (uint64_t)kBounds[i]) i++;
++        buckets[i].fetch_add(1, std::memory_order_relaxed);
++        raise_max(max_ns, ns);
++    }
++};
++
++inline Histogram g_frames, g_presented, g_game;
++inline std::atomic<uint64_t> g_last_frame_ns{0}, g_last_game_ns{0}, g_last_present_ns{0}, g_present_dropped{0};
++
++// Long frames, each with what held it up, for the writer thread. The render thread only adds, the writer only removes.
++struct Spike {
++    uint64_t at_ns, frame_ns, stage_ns[kStages];
++};
++constexpr int kSpikes = 256;
++inline Spike g_spikes[kSpikes];
++inline std::atomic<uint32_t> g_spike_head{0}, g_spike_tail{0};
++inline std::atomic<uint64_t> g_spikes_lost{0}, g_spike_ns{25000000};
++
++inline void add_spike(uint64_t at, uint64_t frame_ns) {
++    const uint32_t head = g_spike_head.load(std::memory_order_relaxed);
++    if (head - g_spike_tail.load(std::memory_order_acquire) >= kSpikes) {
++        g_spikes_lost.fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
++    Spike& s = g_spikes[head % kSpikes];
++    s.at_ns = at;
++    s.frame_ns = frame_ns;
++    for (int i = 0; i < kStages; i++) s.stage_ns[i] = g_stage_ns[i];
++    g_spike_head.store(head + 1, std::memory_order_release);
++}
++
++inline bool next_spike(Spike& out) {
++    const uint32_t tail = g_spike_tail.load(std::memory_order_relaxed);
++    if (tail == g_spike_head.load(std::memory_order_acquire)) return false;
++    out = g_spikes[tail % kSpikes];
++    g_spike_tail.store(tail + 1, std::memory_order_release);
++    return true;
++}
++
++inline void set_paused(bool paused) {
++    g_paused.store(paused, std::memory_order_relaxed);
++    g_last_frame_ns.store(0, std::memory_order_relaxed);
++    g_last_game_ns.store(0, std::memory_order_relaxed);
++    g_last_present_ns.store(0, std::memory_order_relaxed);
++}
++
++// One interval of a series, against the time of its last event. The first after a pause has nothing to compare with.
++inline void tick(Histogram& histogram, std::atomic<uint64_t>& last_ns, uint64_t now, uint64_t* interval = nullptr) {
++    if (g_paused.load(std::memory_order_relaxed)) {
++        last_ns.store(0, std::memory_order_relaxed);
++        return;
++    }
++    const uint64_t last = last_ns.exchange(now, std::memory_order_relaxed);
++    if (!last || now <= last) return;
++    histogram.add(now - last);
++    if (interval) *interval = now - last;
++}
++
++// The render thread reached the end of a frame.
 +inline void frame_presented() {
-+    if (!g_enabled.load(std::memory_order_relaxed)) return;
++    if (!g_frames_on.load(std::memory_order_relaxed)) return;
 +    const uint64_t now = now_ns();
-+    const uint64_t last = g_last_frame_ns.exchange(now, std::memory_order_relaxed);
-+    if (last) add_frame(now - last);
++    uint64_t interval = 0;
++    tick(g_frames, g_last_frame_ns, now, &interval);
++    if (!t_render_thread || !g_enabled.load(std::memory_order_relaxed)) return;
++    if (interval >= g_spike_ns.load(std::memory_order_relaxed)) add_spike(now, interval);
++    for (uint64_t& stage : g_stage_ns) stage = 0;
++}
++
++// The game finished a frame, on its own side of the command queue.
++inline void game_frame() {
++    if (g_enabled.load(std::memory_order_relaxed)) tick(g_game, g_last_game_ns, now_ns());
++}
++
++// A frame reached the screen, from Metal's own time; zero means it never did.
++inline void drawable_presented(double seconds) {
++    if (seconds <= 0) {
++        g_present_dropped.fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
++    tick(g_presented, g_last_present_ns, (uint64_t)(seconds * 1e9));
 +}
 +
 +// Audio. "Empty" is the output queue found at zero by the AX thread, every 3 ms: it can miss a very short gap.
++// "Starved" is the device itself asking for more than the queue held: what was silence, or very near it.
++constexpr uint64_t kAudioBytesPerSecond = 48000 * 4;
 +inline std::atomic<uint64_t> g_audio_frames{0}, g_audio_empty{0}, g_audio_skips{0}, g_audio_gap_max_ns{0}, g_audio_work_max_ns{0};
-+inline std::atomic<uint64_t> g_audio_queue_min{UINT64_MAX};
-+inline std::atomic<bool> g_audio_was_empty{false};
++inline std::atomic<uint64_t> g_audio_queue_min{UINT64_MAX}, g_audio_queue_max{0}, g_audio_starved_n{0}, g_audio_starved_bytes{0};
++inline std::atomic<bool> g_audio_was_empty{false}, g_audio_started{false}, g_audio_was_starved{false};
 +
 +inline void audio_queue(uint64_t queued) {
 +    if (!g_enabled.load(std::memory_order_relaxed)) return;
 +    uint64_t seen = g_audio_queue_min.load(std::memory_order_relaxed);
 +    while (queued < seen && !g_audio_queue_min.compare_exchange_weak(seen, queued, std::memory_order_relaxed)) {
 +    }
++    raise_max(g_audio_queue_max, queued);
 +    const bool empty = queued == 0;
++    if (!empty) g_audio_started.store(true, std::memory_order_relaxed);
 +    if (empty && !g_audio_was_empty.exchange(true, std::memory_order_relaxed)) g_audio_empty.fetch_add(1, std::memory_order_relaxed);
 +    if (!empty) g_audio_was_empty.store(false, std::memory_order_relaxed);
 +}
 +
++// The audio device asks for data, and `missing` bytes of it are not there. Before the game's first sound that is no underrun.
++inline void audio_request(int missing) {
++    if (!g_enabled.load(std::memory_order_relaxed) || !g_audio_started.load(std::memory_order_relaxed) || g_paused.load(std::memory_order_relaxed)) return;
++    const bool starved = missing > 0;
++    if (starved) g_audio_starved_bytes.fetch_add((uint64_t)missing, std::memory_order_relaxed);
++    if (starved != g_audio_was_starved.exchange(starved, std::memory_order_relaxed) && starved) g_audio_starved_n.fetch_add(1, std::memory_order_relaxed);
++}
++
 +class Scoped {
 +   public:
-+    explicit Scoped(Counter& counter) : counter_(g_enabled.load(std::memory_order_relaxed) ? &counter : nullptr), begin_(counter_ ? now_ns() : 0) {}
++    explicit Scoped(Counter& counter, bool wanted = true) : counter_(wanted && g_enabled.load(std::memory_order_relaxed) ? &counter : nullptr), begin_(counter_ ? now_ns() : 0) {}
 +    ~Scoped() {
 +        if (counter_) counter_->add(now_ns() - begin_);
 +    }
@@ -1145,7 +1579,7 @@ index 0000000..cbd72f7
 +    uint64_t begin_;
 +};
 +
-+// The upper bound of the bucket holding this share of frames, 0 with no frame. It is a bound, not an exact time.
++// The upper bound of the bucket holding this share of the samples, 0 with none. It is a bound, not an exact time.
 +inline int percentile_ms(const uint64_t* buckets, double share) {
 +    uint64_t total = 0, seen = 0;
 +    for (int i = 0; i < kBuckets; i++) total += buckets[i];
@@ -1155,42 +1589,81 @@ index 0000000..cbd72f7
 +        seen += buckets[i];
 +        if (seen >= target) return kBounds[i];
 +    }
-+    return 999;
++    return 9999;
 +}
 +
-+inline uint64_t take(std::atomic<uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); }
++inline uint64_t take_buckets(Histogram& histogram, uint64_t* out) {
++    uint64_t total = 0;
++    for (int i = 0; i < kBuckets; i++) total += (out[i] = take(histogram.buckets[i]));
++    return total;
++}
++
++// Samples at or above a bound in milliseconds, which must be one of kBounds.
++inline uint64_t count_over(const uint64_t* buckets, int ms) {
++    uint64_t total = 0;
++    for (int i = 1; i < kBuckets; i++)
++        if (kBounds[i - 1] >= ms) total += buckets[i];
++    return total;
++}
 +
 +inline int write_counter(char* out, size_t room, Counter& c) {
 +    const uint64_t n = take(c.count), total = take(c.total_ns), most = take(c.max_ns);
 +    return snprintf(out, room, ",%llu,%.1f,%.1f", (unsigned long long)n, total / 1e6, most / 1e6);
 +}
 +
-+constexpr const char* kHeader =
-+    "t_s,frames,fps,p50_ms,p95_ms,p99_ms,max_ms,over33,over50,over100,"
-+    "sync_pipe_n,sync_pipe_ms,sync_pipe_max,async_pipe_n,async_pipe_ms,async_pipe_max,sync_shader_n,sync_shader_ms,sync_shader_max,"
-+    "idle_n,idle_ms,idle_max,occl_n,occl_ms,occl_max,readback_n,readback_ms,readback_max,drawable_n,drawable_ms,drawable_max,"
-+    "gpu_ms,cmdbufs,audio_frames,audio_empty,audio_skips,audio_queue_min,audio_gap_max_ms,audio_work_max_ms";
++// The non-empty buckets, as "bound:count" joined by "|", so that sessions can be merged without losing the percentiles.
++inline int write_buckets(char* out, size_t room, const uint64_t* buckets) {
++    int n = 0;
++    out[0] = 0;
++    for (int i = 0; i < kBuckets && (size_t)n + 24 < room; i++)
++        if (buckets[i]) n += snprintf(out + n, room - n, "%s%d:%llu", n ? "|" : "", i < kBuckets - 1 ? kBounds[i] : 9999, (unsigned long long)buckets[i]);
++    return n;
++}
 +
-+// One window of measurements as a CSV line, resetting the counters. Returns its length.
-+inline int write_window(char* out, size_t room, double t_s, double window_s) {
-+    uint64_t buckets[kBuckets], frames = 0;
-+    for (int i = 0; i < kBuckets; i++) frames += (buckets[i] = take(g_frame_buckets[i]));
-+    uint64_t over33 = 0, over50 = 0, over100 = 0;
-+    for (int i = 0; i < kBuckets; i++) {
-+        const int low = i ? kBounds[i - 1] : 0;
-+        if (low >= 33) over33 += buckets[i];
-+        if (low >= 50) over50 += buckets[i];
-+        if (low >= 100) over100 += buckets[i];
-+    }
-+    int n = snprintf(out, room, "%.0f,%llu,%.1f,%d,%d,%d,%.1f,%llu,%llu,%llu", t_s, (unsigned long long)frames, frames / window_s, percentile_ms(buckets, 0.5), percentile_ms(buckets, 0.95),
-+                     percentile_ms(buckets, 0.99), take(g_frame_max_ns) / 1e6, (unsigned long long)over33, (unsigned long long)over50, (unsigned long long)over100);
-+    for (Counter* c : {&g_sync_pipeline, &g_async_pipeline, &g_sync_shader, &g_wait_idle, &g_wait_occlusion, &g_wait_readback, &g_wait_drawable}) n += write_counter(out + n, room - n, *c);
++#define BOTW_PERF_COUNTER_NAMES(n) n "_n," n "_ms," n "_max,"
++constexpr const char* kHeader =
++    "t_s,frames,fps,p50_ms,p95_ms,p99_ms,max_ms,over20,over33,over50,over100,"
++    "pres_n,pres_dropped,pres_p50_ms,pres_p95_ms,pres_p99_ms,pres_max_ms,game_n,game_p50_ms,game_p99_ms,game_max_ms,"
++    BOTW_PERF_COUNTER_NAMES("sync_pipe") BOTW_PERF_COUNTER_NAMES("async_pipe") BOTW_PERF_COUNTER_NAMES("sync_shader") BOTW_PERF_COUNTER_NAMES("shader_compile")
++    BOTW_PERF_COUNTER_NAMES("idle") BOTW_PERF_COUNTER_NAMES("occl") BOTW_PERF_COUNTER_NAMES("readback") BOTW_PERF_COUNTER_NAMES("drawable")
++    BOTW_PERF_COUNTER_NAMES("fifo") BOTW_PERF_COUNTER_NAMES("swap_backlog") BOTW_PERF_COUNTER_NAMES("fs_read")
++    "gpu_busy_ms,gpu_max_ms,cmdbufs,draws_skipped,pipe_queue_max,spikes_lost,"
++    "audio_frames,audio_empty,audio_skips,audio_queue_min,audio_queue_max,audio_gap_max_ms,audio_work_max_ms,audio_starved_n,audio_starved_ms,"
++    "draw_w,draw_h,paused";
++#undef BOTW_PERF_COUNTER_NAMES
++
++constexpr const char* kSpikeHeader = "t_s,frame_ms,sync_pipe_ms,sync_shader_ms,idle_ms,occl_ms,readback_ms,drawable_ms,fifo_ms";
++
++inline int write_spike(char* out, size_t room, const Spike& s, uint64_t begin_ns) {
++    int n = snprintf(out, room, "%.3f,%.1f", (s.at_ns - begin_ns) / 1e9, s.frame_ns / 1e6);
++    for (int i = 0; i < kStages; i++) n += snprintf(out + n, room - n, ",%.1f", s.stage_ns[i] / 1e6);
++    return n;
++}
++
++// One window of measurements as a CSV line, resetting the counters. The two histograms go to `hist` and `present_hist`. Returns the line's length.
++inline int write_window(char* out, size_t room, double t_s, double window_s, char* hist = nullptr, size_t hist_room = 0, char* present_hist = nullptr, size_t present_room = 0) {
++    uint64_t f[kBuckets], p[kBuckets], g[kBuckets];
++    const uint64_t frames = take_buckets(g_frames, f), presents = take_buckets(g_presented, p), games = take_buckets(g_game, g);
++    if (hist) write_buckets(hist, hist_room, f);
++    if (present_hist) write_buckets(present_hist, present_room, p);
++    int n = snprintf(out, room, "%.0f,%llu,%.1f,%d,%d,%d,%.1f,%llu,%llu,%llu,%llu,%llu,%llu,%d,%d,%d,%.1f,%llu,%d,%d,%.1f", t_s, (unsigned long long)frames, frames / window_s, percentile_ms(f, 0.5), percentile_ms(f, 0.95),
++                     percentile_ms(f, 0.99), take(g_frames.max_ns) / 1e6, (unsigned long long)count_over(f, 20), (unsigned long long)count_over(f, 33), (unsigned long long)count_over(f, 50), (unsigned long long)count_over(f, 100),
++                     (unsigned long long)presents, (unsigned long long)take(g_present_dropped), percentile_ms(p, 0.5), percentile_ms(p, 0.95), percentile_ms(p, 0.99), take(g_presented.max_ns) / 1e6,
++                     (unsigned long long)games, percentile_ms(g, 0.5), percentile_ms(g, 0.99), take(g_game.max_ns) / 1e6);
++    for (Counter* c : {&g_sync_pipeline, &g_async_pipeline, &g_sync_shader, &g_shader_compile, &g_wait_idle, &g_wait_occlusion, &g_wait_readback, &g_wait_drawable, &g_fifo_wait, &g_swap_backlog, &g_fs_read}) n += write_counter(out + n, room - n, *c);
 +    const uint64_t queue_min = g_audio_queue_min.exchange(UINT64_MAX, std::memory_order_relaxed);
-+    n += snprintf(out + n, room - n, ",%.1f,%llu,%llu,%llu,%llu,%lld,%.1f,%.1f", take(g_gpu_ns) / 1e6, (unsigned long long)take(g_command_buffers), (unsigned long long)take(g_audio_frames),
-+                  (unsigned long long)take(g_audio_empty), (unsigned long long)take(g_audio_skips), queue_min == UINT64_MAX ? -1LL : (long long)queue_min, take(g_audio_gap_max_ns) / 1e6, take(g_audio_work_max_ns) / 1e6);
++    n += snprintf(out + n, room - n, ",%.1f,%.1f,%llu,%llu,%llu,%llu", take(g_gpu_busy_ns) / 1e6, take(g_gpu_max_ns) / 1e6, (unsigned long long)take(g_command_buffers), (unsigned long long)take(g_draws_skipped), (unsigned long long)take(g_pipe_queue_max),
++                  (unsigned long long)take(g_spikes_lost));
++    n += snprintf(out + n, room - n, ",%llu,%llu,%llu,%lld,%llu,%.1f,%.1f,%llu,%.1f", (unsigned long long)take(g_audio_frames), (unsigned long long)take(g_audio_empty), (unsigned long long)take(g_audio_skips),
++                  queue_min == UINT64_MAX ? -1LL : (long long)queue_min, (unsigned long long)take(g_audio_queue_max), take(g_audio_gap_max_ns) / 1e6, take(g_audio_work_max_ns) / 1e6, (unsigned long long)take(g_audio_starved_n),
++                  take(g_audio_starved_bytes) * 1000.0 / kAudioBytesPerSecond);
++    n += snprintf(out + n, room - n, ",%llu,%llu,%d", (unsigned long long)g_drawable_w.load(std::memory_order_relaxed), (unsigned long long)g_drawable_h.load(std::memory_order_relaxed), g_paused.load(std::memory_order_relaxed) ? 1 : 0);
 +    return n;
 +}
 +}  // namespace botw_perf
++
++// A line for the run's meta.txt, from any thread (perf_ios.mm).
++void botw_perf_note(const char* line);
 +
 +#define BOTW_PERF_SCOPE(counter) botw_perf::Scoped botw_perf_scope_##counter(botw_perf::counter)
 +#define BOTW_PERF_FRAME() botw_perf::frame_presented()
@@ -1198,6 +1671,74 @@ index 0000000..cbd72f7
 +#define BOTW_PERF_SCOPE(counter)
 +#define BOTW_PERF_FRAME()
 +#endif
+diff --git a/runtime/cemu_shims/botw_tune.h b/runtime/cemu_shims/botw_tune.h
+new file mode 100644
+index 0000000..258ff97
+--- /dev/null
++++ b/runtime/cemu_shims/botw_tune.h
+@@ -0,0 +1,62 @@
++// The experiment settings of the split host: <Documents>/botw_tune.txt, one "key=value" a line, "#" starts a comment.
++// Read once at the start, so that an experiment needs a restart and no new install. A missing file, or a key left out,
++// keeps the default, which is always what the host did before the setting existed.
++#pragma once
++#include <map>
++#include <string>
++#include <vector>
++
++namespace botw_tune {
++struct Parsed {
++    std::map<std::string, std::string> values;
++    std::vector<std::string> bad_lines;
++};
++
++inline std::string trim(const std::string& s) {
++    const char* blank = " \t\r\n";
++    const size_t a = s.find_first_not_of(blank);
++    if (a == std::string::npos) return "";
++    return s.substr(a, s.find_last_not_of(blank) - a + 1);
++}
++
++inline Parsed parse(const std::string& text) {
++    Parsed out;
++    size_t at = 0;
++    while (at <= text.size()) {
++        size_t end = text.find('\n', at);
++        if (end == std::string::npos) end = text.size();
++        std::string line = text.substr(at, end - at);
++        at = end + 1;
++        const size_t hash = line.find('#');
++        if (hash != std::string::npos) line.resize(hash);
++        line = trim(line);
++        if (line.empty()) continue;
++        const size_t eq = line.find('=');
++        if (eq == std::string::npos || !eq) {
++            out.bad_lines.push_back(line);
++            continue;
++        }
++        out.values[trim(line.substr(0, eq))] = trim(line.substr(eq + 1));
++    }
++    return out;
++}
++
++// A whole number within [low, high], or the default: a typing mistake must not start an experiment nobody asked for.
++inline long integer(const Parsed& p, const char* key, long fallback, long low, long high) {
++    const auto it = p.values.find(key);
++    if (it == p.values.end() || it->second.empty()) return fallback;
++    size_t used = 0;
++    long value = 0;
++    try {
++        value = std::stol(it->second, &used);
++    } catch (...) {
++        return fallback;
++    }
++    return used == it->second.size() && value >= low && value <= high ? value : fallback;
++}
++
++inline std::string text(const Parsed& p, const char* key, const char* fallback) {
++    const auto it = p.values.find(key);
++    return it == p.values.end() ? fallback : it->second;
++}
++}  // namespace botw_tune
 diff --git a/runtime/include/guest_table.h b/runtime/include/guest_table.h
 index 782c4c3..1f1adc3 100644
 --- a/runtime/include/guest_table.h
@@ -1222,22 +1763,125 @@ index 782c4c3..1f1adc3 100644
  extern const GuestImportEntry g_guest_imports[];
  extern const uint32_t g_guest_import_count;
 +#endif
+diff --git a/runtime/src/audio/output.cpp b/runtime/src/audio/output.cpp
+index 86ff431..c0e2bfc 100644
+--- a/runtime/src/audio/output.cpp
++++ b/runtime/src/audio/output.cpp
+@@ -8,6 +8,7 @@
+ #include <mutex>
+ #include <vector>
+ 
++#include "../../cemu_shims/botw_perf.h"
+ #include "../log.h"
+ #include "../os.h"
+ 
+@@ -23,6 +24,11 @@ double g_sum_sq = 0;
+ uint64_t g_level_frames = 0;
+ }  // namespace
+ 
++#ifdef BOTW_SPLIT_HOST
++// Adds nothing to the stream: SDL says here how much of the device's request the queue cannot cover.
++static void SDLCALL on_device_request(void*, SDL_AudioStream*, int missing, int) { botw_perf::audio_request(missing); }
++#endif
++
+ void init() {
+     std::call_once(g_once, [] {
+         if (g_headless || g_mute) {
+@@ -39,6 +45,18 @@ void init() {
+             LOG("audio: no output device: %s", SDL_GetError());
+             return;
+         }
++#ifdef BOTW_SPLIT_HOST
++        if (botw_perf::g_enabled.load(std::memory_order_relaxed)) {
++            SDL_SetAudioStreamGetCallback(g_stream, on_device_request, nullptr);
++            SDL_AudioSpec device{};
++            int device_frames = 0;
++            if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(g_stream), &device, &device_frames)) {
++                char note[96];
++                snprintf(note, sizeof note, "audio_device=%d Hz, %d channels, %d frames per buffer", device.freq, device.channels, device_frames);
++                botw_perf_note(note);
++            }
++        }
++#endif
+         SDL_ResumeAudioStreamDevice(g_stream);
+         LOG("audio: output 48 kHz stereo");
+     });
+diff --git a/runtime/src/coreinit/fs.cpp b/runtime/src/coreinit/fs.cpp
+index 00c2baa..1dec612 100644
+--- a/runtime/src/coreinit/fs.cpp
++++ b/runtime/src/coreinit/fs.cpp
+@@ -10,6 +10,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "../../cemu_shims/botw_perf.h"
+ #include "hle.h"
+ #include "os.h"
+ 
+@@ -175,7 +176,11 @@ HLE_EXPORT(coreinit, FSReadFile) {
+         RET(FS_FATAL);
+         return;
+     }
+-    size_t n = fread(mem::host(dst), 1, (size_t)size * count, h->f);
++    size_t n;
++    {
++        BOTW_PERF_SCOPE(g_fs_read);
++        n = fread(mem::host(dst), 1, (size_t)size * count, h->f);
++    }
+     RET(size ? (uint32_t)(n / size) : 0);
+ }
+ HLE_EXPORT(coreinit, FSWriteFile) {
+diff --git a/runtime/src/gx2/gx2_core.cpp b/runtime/src/gx2/gx2_core.cpp
+index 1303d1a..102bf6b 100644
+--- a/runtime/src/gx2/gx2_core.cpp
++++ b/runtime/src/gx2/gx2_core.cpp
+@@ -5,6 +5,7 @@
+ #include <mutex>
+ #include <thread>
+ 
++#include "../../cemu_shims/botw_perf.h"
+ #include "../compat/cemu_export.h"
+ #include "../os.h"
+ #include "../thread.h"
+@@ -262,7 +263,11 @@ void GX2SwapScanBuffers() {
+     latte::add_flip_request();
+     gx2WriteGather_submit(pm4HeaderType3(IT_HLE_REQUEST_SWAP_BUFFERS, 1), 0u, pm4HeaderType3(IT_HLE_TRIGGER_SCANBUFFER_SWAP, 1), 0u);
+     g_game_frames++;
++#ifdef BOTW_SPLIT_HOST
++    botw_perf::game_frame();
++#endif
+     while ((sint32)(latte::flip_requests() - latte::flips_executed()) > 5) {
++        BOTW_PERF_SCOPE(g_swap_backlog);
+         threads::WaitMark w("flip (swap backlog)", 0);
+         latte::wait_for_flip();
+     }
 diff --git a/runtime/src/host/window.mm b/runtime/src/host/window.mm
-index 18da3aa..65bd4c7 100644
+index 18da3aa..af2e8ab 100644
 --- a/runtime/src/host/window.mm
 +++ b/runtime/src/host/window.mm
-@@ -25,6 +25,10 @@ extern std::atomic<pthread_t> g_gpu_thread;  // cemu_shims/overlay_menu.cpp: Cem
+@@ -25,6 +25,11 @@ extern std::atomic<pthread_t> g_gpu_thread;  // cemu_shims/overlay_menu.cpp: Cem
  
  extern "C" int g_trace_hle;
  
 +#ifdef BOTW_SPLIT_HOST
++#include "../../cemu_shims/botw_perf.h"
 +extern "C" void botw_boot_step(const char* name);
 +#endif
 +
  namespace window {
  namespace {
  SDL_Window* g_win = nullptr;
-@@ -363,6 +367,15 @@ void run() {
+@@ -289,6 +294,9 @@ void run() {
+             if (e.type == SDL_EVENT_QUIT) g_quit = true;
+             else if (e.type == SDL_EVENT_DID_ENTER_BACKGROUND || e.type == SDL_EVENT_WILL_ENTER_FOREGROUND) {
+                 g_background = e.type == SDL_EVENT_DID_ENTER_BACKGROUND;
++#ifdef BOTW_SPLIT_HOST
++                botw_perf::set_paused(g_background);
++#endif
+                 LOG("app %s", g_background ? "entered the background" : "returning to the foreground");
+             } else if (e.type == SDL_EVENT_TERMINATING) LOG("app terminating");
+             else if (e.type == SDL_EVENT_GAMEPAD_ADDED && !g_pad) {
+@@ -363,6 +371,15 @@ void run() {
              }
          }
          apply_input();
