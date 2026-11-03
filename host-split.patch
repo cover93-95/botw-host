@@ -732,10 +732,10 @@ index 25660c0..648aeaf 100644
  extern thread_local bool g_skip_vsync_wait;
 diff --git a/runtime/src/game/native_duo.cpp b/runtime/src/game/native_duo.cpp
 new file mode 100644
-index 0000000..8eda9dd
+index 0000000..f1db1fe
 --- /dev/null
 +++ b/runtime/src/game/native_duo.cpp
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,158 @@
 +#include "native_duo.h"
 +
 +#include <CommonCrypto/CommonDigest.h>
@@ -754,7 +754,15 @@ index 0000000..8eda9dd
 +namespace native_duo {
 +namespace {
 +std::atomic<bool> g_active{false};
++std::atomic<uint64_t> g_inventory_projection_hits{0};
++std::atomic<uint64_t> g_world_projection_hits{0};
++std::atomic<uint64_t> g_grass_culling_hits{0};
 +constexpr char kV208Sha256[] = "ba58da5b95ce929e005d058ceb08b9b2788d1ab2bbc8a6c189bbadca0bb34d30";
++
++bool should_log_hook_hit(std::atomic<uint64_t>& counter, uint64_t& hit) {
++    hit = counter.fetch_add(1, std::memory_order_relaxed) + 1;
++    return hit == 1 || hit == 1024;
++}
 +
 +struct Word {
 +    uint32_t addr;
@@ -813,6 +821,9 @@ index 0000000..8eda9dd
 +
 +bool configure(bool requested, const std::string& rpx_path) {
 +    g_active = false;
++    g_inventory_projection_hits = 0;
++    g_world_projection_hits = 0;
++    g_grass_culling_hits = 0;
 +    if (!requested) {
 +        LOG("Native Duo: disabled; using the original 16:9 path");
 +        return true;
@@ -845,17 +856,42 @@ index 0000000..8eda9dd
 +// only the resulting FPR, which is equivalent to the small Cemu codecaves without modifying code.
 +BOTW_EXPECT_OPCODE(0x02e2c564, 0xec0b0028)
 +BOTW_HOOK_EXPECT(0x02e2c578, 0xec806024) {
-+    if (active()) c->f[4] = kAspect;
++    if (!active()) return;
++    const double original = c->f[4];
++    c->f[4] = kAspect;
++    uint64_t hit;
++    if (should_log_hook_hit(g_inventory_projection_hits, hit))
++        LOG("Native Duo: inventory projection hook hit %llu: f4 %.6f -> %.6f", (unsigned long long)hit, original, c->f[4]);
 +}
 +
 +BOTW_EXPECT_OPCODE(0x0386d01c, 0xed8d0028)
 +BOTW_HOOK_EXPECT(0x0386d020, 0xed8b6024) {
-+    if (active()) c->f[12] = kAspect;
++    if (!active()) return;
++    const double original = c->f[12];
++    c->f[12] = kAspect;
++    uint64_t hit;
++    if (should_log_hook_hit(g_world_projection_hits, hit))
++        LOG("Native Duo: world projection hook hit %llu: f12 %.6f -> %.6f", (unsigned long long)hit, original, c->f[12]);
 +}
 +
 +BOTW_EXPECT_OPCODE(0x035b0a30, 0x3ca0102f)
 +BOTW_HOOK_EXPECT(0x035b0a38, 0xc16594d8) {
-+    if (active()) c->f[11] = kGameAspect / kAspect;
++    if (!active()) return;
++    const double original = c->f[11];
++    uint64_t hit;
++    const bool log_hit = should_log_hook_hit(g_grass_culling_hits, hit);
++
++    // Cemu applies its grass-culling multiplier only to ultrawide output. At 317:223 the
++    // target is narrower than 16:9, so preserve the lfs result produced by the guest.
++    if (kAspect <= kGameAspect) {
++        if (log_hit)
++            LOG("Native Duo: grass culling hook hit %llu: preserving original f11 %.6f because aspect %.6f <= 16:9", (unsigned long long)hit, original, kAspect);
++        return;
++    }
++
++    c->f[11] = kGameAspect / kAspect;
++    if (log_hit)
++        LOG("Native Duo: grass culling hook hit %llu: f11 %.6f -> %.6f for ultrawide", (unsigned long long)hit, original, c->f[11]);
 +}
 +}  // namespace native_duo
 diff --git a/runtime/src/game/native_duo.h b/runtime/src/game/native_duo.h
